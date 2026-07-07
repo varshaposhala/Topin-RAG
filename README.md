@@ -86,6 +86,43 @@ Type a natural-language query into the app input. Example queries:
 
 The app parses the query and returns matching questions from the indexed dataset.
 
+## How Search Works
+
+When a user submits a query, the app runs multiple steps behind the scenes to convert the text into an exact search request.
+
+### 1. Query normalization
+The raw text is normalized by lowercasing, removing extra whitespace, and breaking the query into searchable tokens. This ensures the search logic treats `Python`, `python`, and `PYTHON` the same.
+
+### 2. Subject, type, and count detection
+The app scans the query for known subjects like `python`, `java`, `sql`, `reactjs`, and `nodejs`. It also detects question types such as:
+
+- `coding`
+- `mcq`
+- `coding analysis`
+- `mixed`
+
+If the query includes a count like `10`, `5`, or `all`, the app records that too.
+
+### 3. Tag extraction and filtering
+Structured tags and curriculum tags are extracted from the query only when they match real catalog tags. The app avoids false matches on common words like `questions` or `coding` when they are not tag values.
+
+### 4. Intent building
+The parsed subject, question type, difficulty, count, tags, and topic keywords are combined into a single intent object. This object describes exactly what the user wants.
+
+### 5. Collection selection
+Using the intent, the app selects the appropriate Qdrant collections to search. For example, a `python coding` request will target `topic_python_coding` and related Python collections, while `sql mcqs` will target SQL MCQ collections.
+
+### 6. Semantic search with embeddings
+If the query is not purely tag-based, the app uses Hugging Face embeddings to convert the query into a vector and compares it against stored question vectors in Qdrant. This finds the most relevant rows even when the query wording differs from the exact stored text.
+
+### 7. Result filtering and ranking
+The app filters matched rows by the detected intent fields and ranks them by relevance. This ensures returned questions match the subject/type and are the best semantic fit.
+
+### 8. Display
+Finally, the matching questions are displayed in the Streamlit UI with a friendly label describing the query results.
+
+This detailed pipeline ensures subject-wise, tag-wise, and field-wise searches work reliably and return the correct rows from the indexed dataset.
+
 ## Notes
 
 - The app relies on Qdrant collections, so make sure your Qdrant instance is reachable and populated.
