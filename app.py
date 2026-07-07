@@ -300,11 +300,11 @@ def fetch_question_hit_by_id(
 def normalize_tag_key(tag: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(tag).upper())
 
-
+data_link=st.secrets.get("data_link")
 @st.cache_data
 def load_question_tag_index():
     # Read CSV header first to detect which tag-like columns actually exist
-    header_df = pd.read_csv("topin_cleaned_data.csv", nrows=0)
+    header_df = pd.read_csv(data_link, nrows=0)
     available_cols = set(header_df.columns.tolist())
 
     # Build effective usecols: always include Question ID and Question Topic
@@ -314,7 +314,7 @@ def load_question_tag_index():
             usecols.append(col)
 
     df = pd.read_csv(
-        "topin_cleaned_data.csv",
+        data_link,
         usecols=usecols,
         low_memory=False,
     )
@@ -455,7 +455,7 @@ def intent_without_topic_scope(intent: dict) -> dict:
 
 @st.cache_data
 def load_csv_questions_by_id() -> dict[str, pd.Series]:
-    df = pd.read_csv("topin_cleaned_data.csv", low_memory=False)
+    df = pd.read_csv(data_link, low_memory=False)
     by_id: dict[str, pd.Series] = {}
     for _, row in df.iterrows():
         qid = normalize_question_id(str(row.get("Question ID", "")))
@@ -683,7 +683,7 @@ def _subtopic_keyword_variants(suffix: str) -> set[str]:
 @st.cache_data
 def load_subtopic_index():
     df = pd.read_csv(
-        "topin_cleaned_data.csv",
+        data_link,
         usecols=["Question Topic", "Question Subtopic"],
         low_memory=False,
     )
@@ -715,7 +715,7 @@ def load_subtopic_index():
 def load_topic_index():
     """Map query keywords to question topics/collections from CSV topic names (e.g. terraform -> topic_terraform_mcq)."""
     df = pd.read_csv(
-        "topin_cleaned_data.csv",
+        data_link,
         usecols=["Question Topic"],
         low_memory=False,
     )
@@ -789,7 +789,7 @@ def resolve_topics_from_query(query: str, question_type: str | None = None) -> d
 
 @st.cache_data
 def load_topic_catalog() -> list[str]:
-    df = pd.read_csv("topin_cleaned_data.csv", usecols=["Question Topic"], low_memory=False)
+    df = pd.read_csv(data_link, usecols=["Question Topic"], low_memory=False)
     return sorted({_raw_value(topic) for topic in df["Question Topic"].dropna().unique() if _raw_value(topic)})
 
 
