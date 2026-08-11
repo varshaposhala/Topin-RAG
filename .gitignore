@@ -1,3 +1,28 @@
+# Secrets & local data
 .streamlit/secrets.toml
 topin_cleaned_data.csv
+qdrant_data/
+.env
+.env.*
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
