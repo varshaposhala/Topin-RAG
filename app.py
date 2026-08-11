@@ -9,18 +9,28 @@ import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qdrant_models
+
+from pinecone_db import PineconeVectorDB, SimpleVectorStore
 
 st.set_page_config(page_title="Topin Global Search", page_icon="🤖", layout="wide")
 st.title("🤖 Topin Global Question Engine")
-QDRANT_URL = st.secrets.get("QDRANT_URL")
-QDRANT_API_KEY = st.secrets.get("QDRANT_API_KEY")
+PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = st.secrets.get("PINECONE_INDEX_NAME") or "topin-questions"
+PINECONE_CLOUD = st.secrets.get("PINECONE_CLOUD") or "aws"
+PINECONE_REGION = st.secrets.get("PINECONE_REGION") or "us-east-1"
 DEFAULT_RESULT_LIMIT = 15
 MAX_RESULT_LIMIT = 500
 ALL_FETCH_CAP = 2000
 RESULTS_PER_PAGE = 20
+
+
+def make_db_client() -> PineconeVectorDB:
+    return PineconeVectorDB(
+        api_key=PINECONE_API_KEY,
+        index_name=PINECONE_INDEX_NAME,
+        cloud=PINECONE_CLOUD,
+        region=PINECONE_REGION,
+    )
 
 SUBJECT_ALIASES = [
     ("html/css", "html_css"),
@@ -248,7 +258,7 @@ def fetch_question_hit_by_id(
     question_id: str,
     topics: list[str] | None = None,
 ) -> dict | None:
-    """Fetch a single question payload from Qdrant by normalized question ID."""
+    """Fetch a single question payload from Pinecone by normalized question ID."""
     _, _, _, question_topics = load_question_tag_index()
     target = normalize_question_id(question_id)
     if not target:
@@ -535,9 +545,35 @@ def _extract_qid_from_point_payload(metadata: dict, content: str) -> str:
     return qid
 
 
+def point_uuid_from_question_id(qid: str) -> str:
+    import uuid
+
+    cleaned = normalize_question_id(qid)
+    if len(cleaned) == 32:
+        return str(uuid.UUID(cleaned))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, cleaned or "empty"))
+
+
 def _fetch_ids_from_collection(client, collection_name: str, needed_ids: set[str]) -> list[dict]:
     if not needed_ids:
         return []
+
+    # Fast path for Pinecone: fetch by deterministic vector IDs
+    if hasattr(client, "fetch_ids"):
+        vector_ids = [point_uuid_from_question_id(qid) for qid in needed_ids]
+        points = client.fetch_ids(collection_name, vector_ids)
+        hits = []
+        for point in points:
+            payload = point.payload or {}
+            hits.append(
+                {
+                    "score": 1.0,
+                    "content": payload.get("page_content", ""),
+                    "collection": collection_name,
+                    "metadata": payload.get("metadata", {}) or {},
+                }
+            )
+        return hits
 
     remaining = set(needed_ids)
     hits: list[dict] = []
@@ -576,16 +612,16 @@ def _fetch_ids_from_collection(client, collection_name: str, needed_ids: set[str
 
 
 def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
-    """Fast tag lookup: only scan collections known from CSV, CSV-only for questions without topic."""
+    """Fast tag lookup: topic namespaces first, CSV for questions without topic."""
     if not matched_ids:
         return []
 
     _, _, _, question_topics = load_question_tag_index()
-    qdrant_ids = {qid for qid in matched_ids if qid in question_topics}
-    csv_only_ids = matched_ids - qdrant_ids
+    indexed_ids = {qid for qid in matched_ids if qid in question_topics}
+    csv_only_ids = matched_ids - indexed_ids
 
     collection_targets: dict[str, set[str]] = {}
-    for qid in qdrant_ids:
+    for qid in indexed_ids:
         collection_targets.setdefault(f"{question_topics[qid]}_questions", set()).add(qid)
 
     hits: list[dict] = []
@@ -608,16 +644,16 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
         for qid in [_extract_qid_from_point_payload(hit.get("metadata") or {}, hit.get("content", ""))]
         if qid
     }
-    missing_qdrant = qdrant_ids - found_ids
-    if missing_qdrant:
-        hits.extend(build_csv_fallback_hits(missing_qdrant, set()))
+    missing_indexed = indexed_ids - found_ids
+    if missing_indexed:
+        hits.extend(build_csv_fallback_hits(missing_indexed, set()))
 
     return hits
 
 
 @st.cache_data(ttl=900)
 def fetch_cached_tag_primary_hits(tag_signature: str, matched_ids_tuple: tuple[str, ...]) -> list[dict]:
-    client = load_qdrant_client()
+    client = load_db_client()
     return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
 
 
@@ -1824,37 +1860,43 @@ def load_embeddings():
 
 
 @st.cache_resource
-def load_qdrant_client():
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=20)
-
+def load_db_client():
+    client = make_db_client()
+    # Namespace is created on first upsert; keep call for compatibility.
     if not client.collection_exists(collection_name="all_questions"):
-        client.create_collection(
-            collection_name="all_questions",
-            vectors_config=qdrant_models.VectorParams(
-                size=384,
-                distance=qdrant_models.Distance.COSINE,
-            ),
-        )
+        client.create_collection(collection_name="all_questions")
     return client
 
 
 @st.cache_resource
 def load_vector_store():
-    return QdrantVectorStore(
-        client=load_qdrant_client(),
+    return SimpleVectorStore(
+        client=load_db_client(),
+        embeddings=load_embeddings(),
         collection_name="all_questions",
-        embedding=load_embeddings(),
     )
 
 
 @st.cache_data(ttl=300)
-def get_searchable_collections(qdrant_url: str, api_key: str):
-    client = QdrantClient(url=qdrant_url, api_key=api_key, timeout=20)
-    return [
-        col.name
-        for col in client.get_collections().collections
-        if col.name.endswith("_questions") and col.name != "all_questions"
-    ]
+def get_searchable_collections(storage_key: str = ""):
+    """List topic collections from CSV (Pinecone free tier uses one namespace)."""
+    _ = storage_key or (PINECONE_INDEX_NAME or "default")
+    topics = load_topic_catalog()
+    collections = [f"{topic}_questions" if not topic.endswith("_questions") else topic for topic in topics]
+    collections.extend(["unassigned_mcq_questions", "unassigned_coding_questions"])
+    return sorted(set(collections))
+
+
+def _count_available_points(client, collections: list[str]) -> int:
+    _, _, _, question_topics = load_question_tag_index()
+    from collections import Counter
+
+    counts = Counter(f"{topic}_questions" for topic in question_topics.values())
+    # Questions without topic are not in question_topics; approximate via client if provided
+    total = sum(counts.get(name, 0) for name in collections)
+    if total:
+        return total
+    return sum(client.get_collection(name).points_count for name in collections)
 
 
 def parse_result_limit(query: str) -> tuple[int | None, bool]:
@@ -2304,10 +2346,6 @@ def _search_collections(client, vector, collections, per_collection_limit):
     return hits
 
 
-def _count_available_points(client, collections: list[str]) -> int:
-    return sum(client.get_collection(name).points_count for name in collections)
-
-
 def _fetch_all_from_collections(client, collections: list[str], max_points: int = MAX_RESULT_LIMIT):
     hits = []
     seen_ids: set = set()
@@ -2459,7 +2497,7 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
     if intent.get("has_explicit_count") and intent.get("limit") == 1:
         fetch_all = False
 
-    all_collections = get_searchable_collections(QDRANT_URL, QDRANT_API_KEY)
+    all_collections = get_searchable_collections()
     if tag_primary and required_tags:
         collections_to_search = [name for name in tag_collections if name in all_collections]
     else:
@@ -2586,7 +2624,7 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
 def fetch_pool_for_intent(client, embeddings, intent: dict, query: str) -> list[dict]:
     """Return all questions matching intent (used for 'give me more' follow-ups)."""
     tag_index, _, _tag_to_questions, _question_topics = load_question_tag_index()
-    all_collections = get_searchable_collections(QDRANT_URL, QDRANT_API_KEY)
+    all_collections = get_searchable_collections()
     required_tags = intent.get("tags") or []
     matched_ids: set[str] = set()
     tag_collections: list[str] = []
@@ -3316,7 +3354,7 @@ def run_search_and_store(client, embeddings, intent: dict, original_query: str) 
 
     if not results:
         collections = filter_collections(
-            get_searchable_collections(QDRANT_URL, QDRANT_API_KEY),
+            get_searchable_collections(),
             intent,
         )
         response = generate_search_intro_llm(
@@ -3340,161 +3378,165 @@ def run_search_and_store(client, embeddings, intent: dict, original_query: str) 
     append_assistant_results(results, search_label, intent, pool, query)
 
 
-try:
-    client = load_qdrant_client()
-    embeddings = load_embeddings()
-except Exception as exc:
-    st.error(f"Failed to connect to the database: {exc}")
-    st.stop()
+# When imported by FastAPI, skip Streamlit UI bootstrap.
+if os.environ.get("TOPIN_API_MODE") == "1":
+    pass
+else:
+    try:
+        client = load_db_client()
+        embeddings = load_embeddings()
+    except Exception as exc:
+        st.error(f"Failed to connect to the database: {exc}")
+        st.stop()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-if "search_context" not in st.session_state:
-    st.session_state.search_context = None
+    if "search_context" not in st.session_state:
+        st.session_state.search_context = None
 
-if st.session_state.get("execute_search"):
-    payload = st.session_state.pop("execute_search")
-    with st.spinner("Searching Topin database..."):
-        try:
-            run_search_and_store(client, embeddings, payload["intent"], payload["query"])
-        except Exception as exc:
-            st.session_state.messages.append(
-                {"role": "assistant", "content": f"Search failed: {exc}"}
-            )
-    st.rerun()
+    if st.session_state.get("execute_search"):
+        payload = st.session_state.pop("execute_search")
+        with st.spinner("Searching Topin database..."):
+            try:
+                run_search_and_store(client, embeddings, payload["intent"], payload["query"])
+            except Exception as exc:
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": f"Search failed: {exc}"}
+                )
+        st.rerun()
 
-for msg_index, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        if message["role"] == "assistant" and message.get("results") is not None:
-            render_results(
-                message["results"],
-                message.get("search_label", ""),
-                f"history_{msg_index}",
-                matched_tags=message.get("matched_tags"),
-            )
-        elif message.get("selection_prompt"):
-            render_selection_prompt(
-                message.get("content", ""),
-                message.get("partial_intent", {}),
-                message.get("original_query", ""),
-                f"history_{msg_index}",
-            )
-        else:
-            st.markdown(message.get("content", ""))
-
-if user_query := st.chat_input(
-    "Ask naturally — e.g. 'all python coding SET_1 questions' or 'give me git mcqs'"
-):
-    restore_search_context_from_messages()
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
-
-    query_intent = parse_query_intent(user_query)
-    context = st.session_state.search_context
-    follow_up = handle_follow_up(user_query, context) if context else None
-
-    with st.chat_message("assistant"):
-        if follow_up is not None:
-            results, search_label = follow_up
-            message_key = f"live_{len(st.session_state.messages)}"
-            response = render_results(
-                results,
-                search_label,
-                message_key,
-                matched_tags=context.get("intent", {}).get("tags"),
-            )
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                    "search_label": search_label,
-                    "results": results,
-                    "matched_tags": context.get("intent", {}).get("tags"),
-                }
-            )
-        else:
-            needs_selection, prompt_message = requires_subject_type_selection(user_query, query_intent)
-            if context and is_context_refinement_query(user_query, context):
-                needs_selection = False
-
-            if needs_selection:
+    for msg_index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant" and message.get("results") is not None:
+                render_results(
+                    message["results"],
+                    message.get("search_label", ""),
+                    f"history_{msg_index}",
+                    matched_tags=message.get("matched_tags"),
+                )
+            elif message.get("selection_prompt"):
                 render_selection_prompt(
-                    prompt_message,
-                    query_intent,
-                    user_query,
-                    f"live_{len(st.session_state.messages)}",
+                    message.get("content", ""),
+                    message.get("partial_intent", {}),
+                    message.get("original_query", ""),
+                    f"history_{msg_index}",
+                )
+            else:
+                st.markdown(message.get("content", ""))
+
+    if user_query := st.chat_input(
+        "Ask naturally — e.g. 'all python coding SET_1 questions' or 'give me git mcqs'"
+    ):
+        restore_search_context_from_messages()
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        query_intent = parse_query_intent(user_query)
+        context = st.session_state.search_context
+        follow_up = handle_follow_up(user_query, context) if context else None
+
+        with st.chat_message("assistant"):
+            if follow_up is not None:
+                results, search_label = follow_up
+                message_key = f"live_{len(st.session_state.messages)}"
+                response = render_results(
+                    results,
+                    search_label,
+                    message_key,
+                    matched_tags=context.get("intent", {}).get("tags"),
                 )
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "content": prompt_message,
-                        "selection_prompt": True,
-                        "partial_intent": query_intent,
-                        "original_query": user_query,
+                        "content": response,
+                        "search_label": search_label,
+                        "results": results,
+                        "matched_tags": context.get("intent", {}).get("tags"),
                     }
                 )
-            elif context and is_context_refinement_query(user_query, context):
-                response = (
-                    "I could not apply that filter to your current question list. "
-                    "Try: `only SUB_TOPIC_GIT_BASICS subtopic questions`"
-                )
-                st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
             else:
-                with st.spinner("Searching Topin database..."):
-                    try:
-                        results, search_label = search_all_collections(
-                            client, embeddings, user_query, intent_override=query_intent
-                        )
-                        if not results:
-                            collections = filter_collections(
-                                get_searchable_collections(QDRANT_URL, QDRANT_API_KEY),
-                                query_intent,
+                needs_selection, prompt_message = requires_subject_type_selection(user_query, query_intent)
+                if context and is_context_refinement_query(user_query, context):
+                    needs_selection = False
+
+                if needs_selection:
+                    render_selection_prompt(
+                        prompt_message,
+                        query_intent,
+                        user_query,
+                        f"live_{len(st.session_state.messages)}",
+                    )
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": prompt_message,
+                            "selection_prompt": True,
+                            "partial_intent": query_intent,
+                            "original_query": user_query,
+                        }
+                    )
+                elif context and is_context_refinement_query(user_query, context):
+                    response = (
+                        "I could not apply that filter to your current question list. "
+                        "Try: `only SUB_TOPIC_GIT_BASICS subtopic questions`"
+                    )
+                    st.markdown(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                else:
+                    with st.spinner("Searching Topin database..."):
+                        try:
+                            results, search_label = search_all_collections(
+                                client, embeddings, user_query, intent_override=query_intent
                             )
-                            response = generate_search_intro_llm(
-                                user_query,
-                                query_intent,
-                                0,
-                                collections,
-                                no_results=True,
-                            )
-                            st.markdown(response)
+                            if not results:
+                                collections = filter_collections(
+                                    get_searchable_collections(),
+                                    query_intent,
+                                )
+                                response = generate_search_intro_llm(
+                                    user_query,
+                                    query_intent,
+                                    0,
+                                    collections,
+                                    no_results=True,
+                                )
+                                st.markdown(response)
+                                st.session_state.messages.append({"role": "assistant", "content": response})
+                                st.session_state.search_context = None
+                            else:
+                                query = build_query_from_intent(query_intent)
+                                pool = (
+                                    fetch_pool_for_intent(client, embeddings, query_intent, query)
+                                    if intent_has_filters(query_intent)
+                                    else results
+                                )
+                                collections_used = sorted({item["collection"] for item in results})
+                                search_label = generate_search_intro_llm(
+                                    user_query,
+                                    query_intent,
+                                    len(results),
+                                    collections_used,
+                                )
+                                message_key = f"live_{len(st.session_state.messages)}"
+                                response = render_results(
+                                    results,
+                                    search_label,
+                                    message_key,
+                                    matched_tags=query_intent.get("tags"),
+                                )
+                                update_search_context(query_intent, results, pool, query)
+                                st.session_state.messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": response,
+                                        "search_label": search_label,
+                                        "results": results,
+                                        "matched_tags": query_intent.get("tags"),
+                                    }
+                                )
+                        except Exception as exc:
+                            response = f"Search failed: {exc}"
+                            st.error(response)
                             st.session_state.messages.append({"role": "assistant", "content": response})
-                            st.session_state.search_context = None
-                        else:
-                            query = build_query_from_intent(query_intent)
-                            pool = (
-                                fetch_pool_for_intent(client, embeddings, query_intent, query)
-                                if intent_has_filters(query_intent)
-                                else results
-                            )
-                            collections_used = sorted({item["collection"] for item in results})
-                            search_label = generate_search_intro_llm(
-                                user_query,
-                                query_intent,
-                                len(results),
-                                collections_used,
-                            )
-                            message_key = f"live_{len(st.session_state.messages)}"
-                            response = render_results(
-                                results,
-                                search_label,
-                                message_key,
-                                matched_tags=query_intent.get("tags"),
-                            )
-                            update_search_context(query_intent, results, pool, query)
-                            st.session_state.messages.append(
-                                {
-                                    "role": "assistant",
-                                    "content": response,
-                                    "search_label": search_label,
-                                    "results": results,
-                                    "matched_tags": query_intent.get("tags"),
-                                }
-                            )
-                    except Exception as exc:
-                        response = f"Search failed: {exc}"
-                        st.error(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
