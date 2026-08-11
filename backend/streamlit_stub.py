@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import types
 from typing import Any
 
@@ -16,17 +17,17 @@ def install_streamlit_stub(secrets: dict | None = None) -> types.ModuleType:
 
     st = types.ModuleType("streamlit")
 
-    def _identity_decorator(*args, **kwargs):
-        if args and callable(args[0]) and not kwargs:
-            return args[0]
+    def _cache_decorator(*dargs, **dkwargs):
+        if dargs and callable(dargs[0]) and not dkwargs:
+            return functools.lru_cache(maxsize=None)(dargs[0])
 
         def wrap(fn):
-            return fn
+            return functools.lru_cache(maxsize=None)(fn)
 
         return wrap
 
-    st.cache_data = _identity_decorator
-    st.cache_resource = _identity_decorator
+    st.cache_data = _cache_decorator
+    st.cache_resource = _cache_decorator
     st.secrets = _Secrets(secrets or {})
     st.session_state = {}
     st.set_page_config = lambda **kwargs: None
