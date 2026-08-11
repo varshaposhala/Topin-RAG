@@ -59,16 +59,21 @@ def get_embeddings():
 
 @app.on_event("startup")
 def warm_up() -> None:
-    """Load the embedding model, DB client, and CSV-backed indexes eagerly.
+    """Best-effort eager load of the embedding client, DB client, and CSV indexes.
 
-    Without this, the first search request pays for a Hugging Face model
-    download + CSV fetch synchronously, which can exceed Render's proxy
-    timeout and surface as a 502 with no application log line.
+    This is purely an optimization so the first search doesn't pay the full
+    load cost synchronously. Failures here must NOT block startup, since
+    Uvicorn only binds its port after the startup event finishes — a raised
+    exception here would prevent the whole service from coming up on Render.
+    Any error is deferred to the first real request instead.
     """
-    get_embeddings()
-    get_client()
-    engine.load_topic_catalog()
-    engine.load_question_tag_index()
+    try:
+        get_embeddings()
+        get_client()
+        engine.load_topic_catalog()
+        engine.load_question_tag_index()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warm_up] non-fatal startup warm-up failure: {exc}", flush=True)
 
 
 class SelectionPayload(BaseModel):
