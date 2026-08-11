@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 os.environ["TOPIN_API_MODE"] = "1"
 
 from backend.config import apply_secrets_to_environ  # noqa: E402
+from backend.hf_embeddings import RemoteHFEmbeddings  # noqa: E402
 from backend.streamlit_stub import install_streamlit_stub  # noqa: E402
 
 _secrets = apply_secrets_to_environ()
@@ -52,8 +53,22 @@ def get_client():
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        _embeddings = engine.load_embeddings()
+        _embeddings = RemoteHFEmbeddings()
     return _embeddings
+
+
+@app.on_event("startup")
+def warm_up() -> None:
+    """Load the embedding model, DB client, and CSV-backed indexes eagerly.
+
+    Without this, the first search request pays for a Hugging Face model
+    download + CSV fetch synchronously, which can exceed Render's proxy
+    timeout and surface as a 502 with no application log line.
+    """
+    get_embeddings()
+    get_client()
+    engine.load_topic_catalog()
+    engine.load_question_tag_index()
 
 
 class SelectionPayload(BaseModel):

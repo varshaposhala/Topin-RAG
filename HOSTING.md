@@ -67,7 +67,12 @@ Deploy the image to Render, Railway, Fly.io, or Azure Container Apps.
 - `PINECONE_INDEX_NAME` (default `topin-questions`)
 - `PINECONE_CLOUD` / `PINECONE_REGION`
 - `OPENROUTER_API_KEY` (optional, for friendlier intros)
-- Keep `topin_cleaned_data.csv` in the image/workdir for tag index + CSV fallback
+- `HUGGINGFACEHUB_API_TOKEN` — required by the web backend. It calls the Hugging Face
+  Inference API for query embeddings instead of loading the model locally (loading
+  torch/sentence-transformers in-process needs 500MB+ RAM, which exceeds small hosting
+  tiers like Render's 512MB plan). Get a free token at
+  https://huggingface.co/settings/tokens.
+- `data_link` — public URL to `topin_cleaned_data.csv` (used for tag index + topic catalog)
 
 ## Streamlit (legacy)
 

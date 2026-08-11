@@ -8,8 +8,6 @@ import pandas as pd
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from langchain_huggingface import HuggingFaceEmbeddings
-
 from pinecone_db import PineconeVectorDB, SimpleVectorStore
 
 st.set_page_config(page_title="Topin Global Search", page_icon="🤖", layout="wide")
@@ -1856,6 +1854,8 @@ def rerank_hits_by_similarity(hits: list[dict], query: str, embeddings, limit: i
 
 @st.cache_resource
 def load_embeddings():
+    from langchain_huggingface import HuggingFaceEmbeddings
+
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 

@@ -28,6 +28,7 @@ def load_secrets() -> dict:
         "PINECONE_CLOUD",
         "PINECONE_REGION",
         "OPENROUTER_API_KEY",
+        "HUGGINGFACEHUB_API_TOKEN",
         "data_link",
     ):
         if os.getenv(key):
