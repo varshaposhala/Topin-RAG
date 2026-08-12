@@ -67,7 +67,15 @@ Deploy the image to Render, Railway, Fly.io, or Azure Container Apps.
 - `PINECONE_INDEX_NAME` (default `topin-questions`)
 - `PINECONE_CLOUD` / `PINECONE_REGION`
 - `OPENROUTER_API_KEY` (optional, for friendlier intros)
-- Keep `topin_cleaned_data.csv` in the image/workdir for tag index + CSV fallback
+- `EMBEDDINGS_BACKEND` — `local` (default, recommended) or `remote`
+  - **local**: runs `sentence-transformers` on the server (no HF Inference permission needed)
+  - **remote**: uses Hugging Face Inference API — token must allow Inference access
+- `SKIP_LLM_INTRO=1` — optional; skips OpenRouter intro text for faster responses
+- `data_link` — public URL to `topin_cleaned_data.csv` (used for tag index + topic catalog)
+
+> **Note:** The previous `HUGGINGFACEHUB_API_TOKEN` remote path caused 403 errors when the
+> token lacked Inference Providers permission. Prefer `EMBEDDINGS_BACKEND=local`.
+> Use a host plan with enough RAM (~1GB+) for the local model.
 
 ## Streamlit (legacy)
 

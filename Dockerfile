@@ -24,6 +24,8 @@ WORKDIR /app
 COPY . .
 
 ENV PORT=8000
+ENV EMBEDDINGS_BACKEND=local
+ENV SKIP_LLM_INTRO=1
 EXPOSE 8000
 
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

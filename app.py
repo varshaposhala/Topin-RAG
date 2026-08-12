@@ -8,8 +8,6 @@ import pandas as pd
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from langchain_huggingface import HuggingFaceEmbeddings
-
 from pinecone_db import PineconeVectorDB, SimpleVectorStore
 
 st.set_page_config(page_title="Topin Global Search", page_icon="🤖", layout="wide")
@@ -1856,7 +1854,23 @@ def rerank_hits_by_similarity(hits: list[dict], query: str, embeddings, limit: i
 
 @st.cache_resource
 def load_embeddings():
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    """Local MiniLM embeddings — matches Pinecone index vectors (384-dim)."""
+    from sentence_transformers import SentenceTransformer
+
+    class _LocalEmbeddings:
+        def __init__(self):
+            self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+        def embed_query(self, text: str) -> list[float]:
+            return [float(x) for x in self.model.encode(text, normalize_embeddings=True)]
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            if not texts:
+                return []
+            vectors = self.model.encode(texts, normalize_embeddings=True, batch_size=32)
+            return [[float(x) for x in row] for row in vectors]
+
+    return _LocalEmbeddings()
 
 
 @st.cache_resource

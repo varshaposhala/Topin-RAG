@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 os.environ["TOPIN_API_MODE"] = "1"
 
 from backend.config import apply_secrets_to_environ  # noqa: E402
+from backend.hf_embeddings import create_embeddings  # noqa: E402
 from backend.streamlit_stub import install_streamlit_stub  # noqa: E402
 
 _secrets = apply_secrets_to_environ()
@@ -52,8 +53,29 @@ def get_client():
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        _embeddings = engine.load_embeddings()
+        _embeddings = create_embeddings()
     return _embeddings
+
+
+class _LazyEmbeddings:
+    """Load the embedding model only when a vector call is actually needed."""
+
+    def embed_query(self, text: str) -> list[float]:
+        return get_embeddings().embed_query(text)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return get_embeddings().embed_documents(texts)
+
+
+@app.on_event("startup")
+def warm_up() -> None:
+    """Warm DB + CSV indexes; embeddings load lazily on first vector search."""
+    try:
+        get_client()
+        engine.load_topic_catalog()
+        engine.load_question_tag_index()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warm_up] non-fatal startup warm-up failure: {exc}", flush=True)
 
 
 class SelectionPayload(BaseModel):
@@ -166,7 +188,7 @@ def search(payload: SearchRequest):
         raise HTTPException(status_code=400, detail="Query is required")
 
     client = get_client()
-    embeddings = get_embeddings()
+    embeddings = _LazyEmbeddings()
 
     if payload.session_id and payload.session_id in _SESSIONS:
         ctx = _SESSIONS[payload.session_id]
@@ -230,17 +252,27 @@ def search(payload: SearchRequest):
             "questions": [],
         }
 
-    pool = (
-        engine.fetch_pool_for_intent(client, embeddings, intent, query)
-        if engine.intent_has_filters(intent)
-        else results
-    )
-    intro = engine.generate_search_intro_llm(
-        query,
-        intent,
-        len(results),
-        sorted({item.get("collection", "") for item in results}),
-    )
+    # Tag / fetch-all searches already return the full set — skip a second full scan.
+    if engine.is_tag_primary_intent(intent) or intent.get("fetch_all"):
+        pool = results
+    elif engine.intent_has_filters(intent):
+        pool = engine.fetch_pool_for_intent(client, embeddings, intent, query)
+    else:
+        pool = results
+
+    # LLM intro is optional; skip when disabled or when it would add latency.
+    intro = label
+    if os.getenv("SKIP_LLM_INTRO", "").strip() not in {"1", "true", "yes"}:
+        try:
+            intro = engine.generate_search_intro_llm(
+                query,
+                intent,
+                len(results),
+                sorted({item.get("collection", "") for item in results}),
+            ) or label
+        except Exception:  # noqa: BLE001
+            intro = label
+
     session_id = store_session(intent, results, pool, query)
     _, tag_display, _, _ = engine.load_question_tag_index()
     return {
