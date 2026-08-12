@@ -1,7 +1,7 @@
 """Embedding backends for query vectors (compatible with all-MiniLM-L6-v2 / 384-dim).
 
-Default: local sentence-transformers (no Hugging Face Inference API permissions needed).
-Optional: remote HF Inference API via EMBEDDINGS_BACKEND=remote.
+Default for hosting: fastembed (ONNX, low RAM — works on Render free/starter).
+Optional: local sentence-transformers, or remote HF Inference API.
 """
 
 from __future__ import annotations
@@ -19,8 +19,31 @@ class Embeddings(Protocol):
     def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
 
 
+class FastEmbedEmbeddings:
+    """ONNX MiniLM via fastembed — same model family, much less RAM than torch."""
+
+    def __init__(self, model_name: str = MODEL_NAME):
+        from fastembed import TextEmbedding
+
+        # Prefer a writable project cache when present (helps Windows/dev).
+        cache = os.getenv("FASTEMBED_CACHE_PATH")
+        kwargs = {"model_name": model_name}
+        if cache:
+            kwargs["cache_dir"] = cache
+        self.model = TextEmbedding(**kwargs)
+
+    def embed_query(self, text: str) -> list[float]:
+        vector = next(self.model.embed([text]))
+        return [float(x) for x in vector]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return [[float(x) for x in row] for row in self.model.embed(texts)]
+
+
 class LocalSTEmbeddings:
-    """Run MiniLM locally — same model used to build the Pinecone index."""
+    """Run MiniLM locally with sentence-transformers (heavier; needs ~1GB+ RAM)."""
 
     def __init__(self, model_name: str = MODEL_NAME):
         from sentence_transformers import SentenceTransformer
@@ -57,7 +80,6 @@ class RemoteHFEmbeddings:
                 "HUGGINGFACEHUB_API_TOKEN / HF_TOKEN is missing for remote embeddings."
             )
         self.token = resolved
-        # Classic Inference API endpoint (not Inference Providers router)
         self.url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model_name}"
 
     def _post(self, inputs):
@@ -74,17 +96,14 @@ class RemoteHFEmbeddings:
             raise RuntimeError(
                 "Hugging Face token lacks Inference API permission. "
                 "Create a token with Inference access at https://huggingface.co/settings/tokens "
-                "or set EMBEDDINGS_BACKEND=local."
+                "or set EMBEDDINGS_BACKEND=fast."
             )
         response.raise_for_status()
-        data = response.json()
-        return data
+        return response.json()
 
     def _as_vector(self, data) -> list[float]:
-        # Sentence embedding: flat list of floats
         if isinstance(data, list) and data and isinstance(data[0], (int, float)):
             return [float(x) for x in data]
-        # Token embeddings: mean-pool
         if isinstance(data, list) and data and isinstance(data[0], list):
             dim = len(data[0])
             sums = [0.0] * dim
@@ -105,21 +124,31 @@ class RemoteHFEmbeddings:
 def create_embeddings() -> Embeddings:
     """
     EMBEDDINGS_BACKEND:
-      - local (default): sentence-transformers on CPU
+      - fast (default on Render/Docker): fastembed ONNX, low RAM
+      - local: sentence-transformers + torch (~1GB+ RAM)
       - remote: Hugging Face Inference API
-      - auto: prefer local, fall back to remote
+      - auto: fast → local → remote
     """
-    backend = (os.getenv("EMBEDDINGS_BACKEND") or "local").strip().lower()
+    backend = (os.getenv("EMBEDDINGS_BACKEND") or "fast").strip().lower()
 
     if backend == "remote":
         return RemoteHFEmbeddings()
 
-    if backend == "auto":
-        try:
-            return LocalSTEmbeddings()
-        except Exception as local_exc:  # noqa: BLE001
-            print(f"[embeddings] local failed ({local_exc}); trying remote", flush=True)
-            return RemoteHFEmbeddings()
+    if backend == "local":
+        return LocalSTEmbeddings()
 
-    # default local
-    return LocalSTEmbeddings()
+    if backend == "auto":
+        for factory, name in (
+            (FastEmbedEmbeddings, "fast"),
+            (LocalSTEmbeddings, "local"),
+            (RemoteHFEmbeddings, "remote"),
+        ):
+            try:
+                print(f"[embeddings] trying {name}", flush=True)
+                return factory()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[embeddings] {name} failed: {exc}", flush=True)
+        raise RuntimeError("No embedding backend could be loaded.")
+
+    # default: fast (Render-friendly)
+    return FastEmbedEmbeddings()

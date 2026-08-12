@@ -67,6 +67,15 @@ class _LazyEmbeddings:
         return get_embeddings().embed_documents(texts)
 
 
+@app.get("/api/health")
+def health():
+    """Lightweight health check for Render / load balancers."""
+    return {
+        "ok": True,
+        "embeddings_backend": os.getenv("EMBEDDINGS_BACKEND", "fast"),
+    }
+
+
 @app.on_event("startup")
 def warm_up() -> None:
     """Warm DB + CSV indexes; embeddings load lazily on first vector search."""

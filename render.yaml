@@ -1,0 +1,29 @@
+# Render Blueprint — deploy from branch `new` (web app is NOT on main).
+# Dashboard: set Branch = new if you create the service manually.
+
+services:
+  - type: web
+    name: topin-rag
+    runtime: docker
+    plan: starter
+    branch: new
+    healthCheckPath: /api/health
+    envVars:
+      - key: EMBEDDINGS_BACKEND
+        value: fast
+      - key: SKIP_LLM_INTRO
+        value: "1"
+      - key: TOPIN_API_MODE
+        value: "1"
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: topin-questions
+      - key: PINECONE_CLOUD
+        value: aws
+      - key: PINECONE_REGION
+        value: us-east-1
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: data_link
+        sync: false

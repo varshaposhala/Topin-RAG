@@ -23,9 +23,12 @@ RUN npm run build
 WORKDIR /app
 COPY . .
 
-ENV PORT=8000
-ENV EMBEDDINGS_BACKEND=local
+# Pre-download ONNX MiniLM so first search on Render is fast
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2')"
+
+ENV EMBEDDINGS_BACKEND=fast
 ENV SKIP_LLM_INTRO=1
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render injects $PORT — must bind to it (not hardcoded 8000)
+CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
