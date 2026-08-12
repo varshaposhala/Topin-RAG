@@ -67,12 +67,15 @@ Deploy the image to Render, Railway, Fly.io, or Azure Container Apps.
 - `PINECONE_INDEX_NAME` (default `topin-questions`)
 - `PINECONE_CLOUD` / `PINECONE_REGION`
 - `OPENROUTER_API_KEY` (optional, for friendlier intros)
-- `HUGGINGFACEHUB_API_TOKEN` — required by the web backend. It calls the Hugging Face
-  Inference API for query embeddings instead of loading the model locally (loading
-  torch/sentence-transformers in-process needs 500MB+ RAM, which exceeds small hosting
-  tiers like Render's 512MB plan). Get a free token at
-  https://huggingface.co/settings/tokens.
+- `EMBEDDINGS_BACKEND` — `local` (default, recommended) or `remote`
+  - **local**: runs `sentence-transformers` on the server (no HF Inference permission needed)
+  - **remote**: uses Hugging Face Inference API — token must allow Inference access
+- `SKIP_LLM_INTRO=1` — optional; skips OpenRouter intro text for faster responses
 - `data_link` — public URL to `topin_cleaned_data.csv` (used for tag index + topic catalog)
+
+> **Note:** The previous `HUGGINGFACEHUB_API_TOKEN` remote path caused 403 errors when the
+> token lacked Inference Providers permission. Prefer `EMBEDDINGS_BACKEND=local`.
+> Use a host plan with enough RAM (~1GB+) for the local model.
 
 ## Streamlit (legacy)
 
