@@ -131,6 +131,11 @@ def create_embeddings() -> Embeddings:
     """
     backend = (os.getenv("EMBEDDINGS_BACKEND") or "fast").strip().lower()
 
+    # Render free/starter OOMs on torch MiniLM — never use local there.
+    if os.getenv("RENDER") and backend == "local":
+        print("[embeddings] RENDER detected: overriding local → fast", flush=True)
+        backend = "fast"
+
     if backend == "remote":
         return RemoteHFEmbeddings()
 

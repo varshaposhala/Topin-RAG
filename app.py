@@ -1837,6 +1837,12 @@ def rerank_hits_by_similarity(hits: list[dict], query: str, embeddings, limit: i
     if not hits:
         return hits
 
+    # Embedding every hit OOM/timeouts on small hosts (Render). Keep Pinecone/order scores.
+    skip = os.getenv("SKIP_RERANK", "").strip().lower() in {"1", "true", "yes"}
+    if skip or os.getenv("RENDER"):
+        ranked = sorted(hits, key=lambda item: float(item.get("score") or 0), reverse=True)
+        return ranked[:limit]
+
     query_vector = embeddings.embed_query(query)
     batch_size = 64
     scored: list[dict] = []
