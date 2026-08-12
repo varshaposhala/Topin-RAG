@@ -6,6 +6,15 @@
 - **Backend**: FastAPI in `backend/` — same search logic as the Streamlit app
 - **Database**: Pinecone cloud (`topin-questions`)
 
+## Important: deploy branch
+
+The FastAPI + React app lives on branch **`new`**.
+
+Branch **`main`** is still the old Streamlit-only app.  
+If Render is set to `main`, your pushes to `new` will **not** go live.
+
+In Render → Settings → Build & Deploy → **Branch = `new`**.
+
 ## Local development
 
 ### 1. Install Python deps
@@ -29,6 +38,7 @@ Frontend: http://localhost:5173 (proxies `/api` to backend)
 ```bash
 # from project root
 set TOPIN_API_MODE=1
+set EMBEDDINGS_BACKEND=fast
 uvicorn backend.main:app --reload --port 8000
 ```
 
@@ -56,10 +66,33 @@ docker run -p 8000:8000 ^
   -e PINECONE_CLOUD=aws ^
   -e PINECONE_REGION=us-east-1 ^
   -e OPENROUTER_API_KEY=optional ^
+  -e data_link=https://your-csv-url ^
   topin-app
 ```
 
-Deploy the image to Render, Railway, Fly.io, or Azure Container Apps.
+### Render (recommended)
+
+1. Push branch **`new`** to GitHub.
+2. New Web Service → connect `Topin-RAG` → **Docker**.
+3. Set **Branch** to **`new`** (not `main`).
+4. Health check path: `/api/health`.
+5. Add env vars:
+
+| Key | Value |
+|-----|--------|
+| `PINECONE_API_KEY` | your Pinecone key |
+| `PINECONE_INDEX_NAME` | `topin-questions` |
+| `PINECONE_CLOUD` | `aws` |
+| `PINECONE_REGION` | `us-east-1` |
+| `EMBEDDINGS_BACKEND` | `fast` |
+| `SKIP_LLM_INTRO` | `1` |
+| `data_link` | public URL to `topin_cleaned_data.csv` |
+| `OPENROUTER_API_KEY` | optional |
+
+6. Use at least **Starter** (512MB free often OOMs during Docker build/runtime).
+7. After deploy, open `https://YOUR-SERVICE.onrender.com/api/health` — should return `{"ok": true, ...}`.
+
+Do **not** set `EMBEDDINGS_BACKEND=local` on Render free/starter — torch MiniLM needs ~1GB+ RAM and will crash the service.
 
 ### Required env vars
 
@@ -67,15 +100,12 @@ Deploy the image to Render, Railway, Fly.io, or Azure Container Apps.
 - `PINECONE_INDEX_NAME` (default `topin-questions`)
 - `PINECONE_CLOUD` / `PINECONE_REGION`
 - `OPENROUTER_API_KEY` (optional, for friendlier intros)
-- `EMBEDDINGS_BACKEND` — `local` (default, recommended) or `remote`
-  - **local**: runs `sentence-transformers` on the server (no HF Inference permission needed)
-  - **remote**: uses Hugging Face Inference API — token must allow Inference access
-- `SKIP_LLM_INTRO=1` — optional; skips OpenRouter intro text for faster responses
-- `data_link` — public URL to `topin_cleaned_data.csv` (used for tag index + topic catalog)
-
-> **Note:** The previous `HUGGINGFACEHUB_API_TOKEN` remote path caused 403 errors when the
-> token lacked Inference Providers permission. Prefer `EMBEDDINGS_BACKEND=local`.
-> Use a host plan with enough RAM (~1GB+) for the local model.
+- `EMBEDDINGS_BACKEND` — `fast` (default, Render-safe), `local`, or `remote`
+  - **fast**: ONNX MiniLM via `fastembed` (low RAM, no HF Inference token)
+  - **local**: `sentence-transformers` + torch (~1GB+ RAM)
+  - **remote**: Hugging Face Inference API — token must allow Inference access
+- `SKIP_LLM_INTRO=1` — skips OpenRouter intro text for faster responses
+- `data_link` — public URL to `topin_cleaned_data.csv` (tag index + topic catalog)
 
 ## Streamlit (legacy)
 
