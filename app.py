@@ -463,6 +463,7 @@ def intent_without_topic_scope(intent: dict) -> dict:
 
 @st.cache_data
 def load_csv_questions_by_id() -> dict[str, pd.Series]:
+    # Kept for compatibility; prefer build_csv_hits_for_ids on small hosts.
     df = pd.read_csv(data_link, low_memory=False)
     by_id: dict[str, pd.Series] = {}
     for _, row in df.iterrows():
@@ -470,6 +471,35 @@ def load_csv_questions_by_id() -> dict[str, pd.Series]:
         if qid:
             by_id[qid] = row
     return by_id
+
+
+_CSV_HIT_COLUMNS = [
+    "Question ID",
+    "Question Topic",
+    "Question Subtopic",
+    "Question Difficulty",
+    "Question Content",
+    "Options Data",
+    "Unit Tag of Question",
+    "Module Tag of Question",
+    "Course Tag of Question",
+    "Grit Tag of Question",
+    "Extra Tags",
+]
+
+
+def build_csv_hits_for_ids(matched_ids: set[str]) -> list[dict]:
+    """Build hits for specific IDs without caching 76k row Series (Render OOM safe)."""
+    if not matched_ids:
+        return []
+    header = pd.read_csv(data_link, nrows=0)
+    usecols = [col for col in _CSV_HIT_COLUMNS if col in header.columns]
+    if "Question ID" not in usecols:
+        return []
+    df = pd.read_csv(data_link, usecols=usecols, low_memory=False)
+    ids = df["Question ID"].astype(str).map(normalize_question_id)
+    subset = df.loc[ids.isin(matched_ids)]
+    return [build_hit_from_csv_row(pd.Series(rec)) for rec in subset.to_dict("records")]
 
 
 def build_hit_from_csv_row(row: pd.Series) -> dict:
@@ -522,8 +552,7 @@ def build_csv_fallback_hits(matched_ids: set[str], found_ids: set[str]) -> list[
     missing = matched_ids - found_ids
     if not missing:
         return []
-    by_id = load_csv_questions_by_id()
-    return [build_hit_from_csv_row(by_id[qid]) for qid in sorted(missing) if qid in by_id]
+    return build_csv_hits_for_ids(missing)
 
 
 TAG_SCROLL_BATCH = 256
@@ -610,9 +639,18 @@ def _fetch_ids_from_collection(client, collection_name: str, needed_ids: set[str
 
 
 def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
-    """Fast tag lookup: topic namespaces first, CSV for questions without topic."""
+    """Tag lookup from CSV first (memory-safe on Render); Pinecone only if CSV unavailable."""
     if not matched_ids:
         return []
+
+    # Small/medium tag sets: CSV-only avoids Pinecone fan-out + full-CSV Series cache OOM.
+    if len(matched_ids) <= 500 and data_link:
+        try:
+            hits = build_csv_hits_for_ids(matched_ids)
+            if hits:
+                return hits
+        except Exception as exc:  # noqa: BLE001
+            print(f"[tag_primary] CSV path failed, trying Pinecone: {exc}", flush=True)
 
     _, _, _, question_topics = load_question_tag_index()
     indexed_ids = {qid for qid in matched_ids if qid in question_topics}
@@ -624,7 +662,9 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
 
     hits: list[dict] = []
     if collection_targets:
-        max_workers = min(8, len(collection_targets))
+        if client is None:
+            client = load_db_client()
+        max_workers = min(4, len(collection_targets))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [
                 pool.submit(_fetch_ids_from_collection, client, collection_name, needed_ids)
@@ -651,8 +691,13 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
 
 @st.cache_data(ttl=900)
 def fetch_cached_tag_primary_hits(tag_signature: str, matched_ids_tuple: tuple[str, ...]) -> list[dict]:
-    client = load_db_client()
-    return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
+    # Avoid creating a second DB client when CSV path can answer the tag query.
+    client = None
+    try:
+        return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
+    except Exception:
+        client = load_db_client()
+        return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
 
 
 SUBTOPIC_QUERY_STOPWORDS = {
