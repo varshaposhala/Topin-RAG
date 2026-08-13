@@ -78,11 +78,16 @@ def health():
 
 @app.on_event("startup")
 def warm_up() -> None:
-    """Warm DB + CSV indexes; embeddings load lazily on first vector search."""
+    """Warm only lightweight catalogs on Render; heavy indexes load lazily."""
     try:
         get_client()
         engine.load_topic_catalog()
-        engine.load_question_tag_index()
+        # Full tag index is large — skip eager load on small hosts.
+        if not (
+            os.getenv("RENDER")
+            or os.getenv("LIGHT_MEMORY", "").strip().lower() in {"1", "true", "yes"}
+        ):
+            engine.load_question_tag_index()
     except Exception as exc:  # noqa: BLE001
         print(f"[warm_up] non-fatal startup warm-up failure: {exc}", flush=True)
 
@@ -128,6 +133,8 @@ def serialize_results(results: list[dict], matched_tags: list[str] | None = None
             parsed.get("question_id") or item.get("metadata", {}).get("question_id", "")
         )
         tags = sorted(tag_index.get(engine.normalize_question_id(qid), set())) if qid else []
+        if not tags:
+            tags = sorted(engine.get_item_tag_tokens(item, tag_index))
         serialized.append(
             {
                 "index": idx,

@@ -13,6 +13,8 @@ services:
         value: fast
       - key: SKIP_LLM_INTRO
         value: "1"
+      - key: LIGHT_MEMORY
+        value: "1"
       - key: TOPIN_API_MODE
         value: "1"
       - key: PINECONE_API_KEY
