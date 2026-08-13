@@ -91,8 +91,9 @@ docker run -p 8000:8000 ^
 
 6. Use at least **Starter** (512MB free often OOMs during Docker build/runtime).
 7. After deploy, open `https://YOUR-SERVICE.onrender.com/api/health` — should return `{"ok": true, ...}`.
+8. If search returns **HTTP 502**: check Render logs for OOM. Remove any `EMBEDDINGS_BACKEND=local` env var (must be `fast`). Ensure `data_link` is set.
 
-Do **not** set `EMBEDDINGS_BACKEND=local` on Render free/starter — torch MiniLM needs ~1GB+ RAM and will crash the service.
+Do **not** set `EMBEDDINGS_BACKEND=local` on Render free/starter — torch MiniLM needs ~1GB+ RAM and will crash the service (502).
 
 ### Required env vars
 

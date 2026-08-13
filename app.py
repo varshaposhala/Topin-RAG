@@ -309,67 +309,72 @@ def normalize_tag_key(tag: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(tag).upper())
 
 data_link=st.secrets.get("data_link")
+
+
+def _light_memory_mode() -> bool:
+    return os.getenv("RENDER") is not None or os.getenv("LIGHT_MEMORY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 @st.cache_data
 def load_question_tag_index():
-    # Read CSV header first to detect which tag-like columns actually exist
+    """Build tag catalogs. In LIGHT_MEMORY/RENDER mode, skip per-question maps (OOM-safe)."""
+    if not data_link:
+        return {}, {}, {}, {}
+
     header_df = pd.read_csv(data_link, nrows=0)
     available_cols = set(header_df.columns.tolist())
 
-    # Build effective usecols: always include Question ID and Question Topic
     usecols = ["Question ID", "Question Topic"]
     for col in list(TAG_SOURCE_COLUMNS) + EXTRA_POTENTIAL_TAG_FIELDS:
         if col in available_cols and col not in usecols:
             usecols.append(col)
 
-    df = pd.read_csv(
-        data_link,
-        usecols=usecols,
-        low_memory=False,
-    )
+    light = _light_memory_mode()
     tag_index: dict[str, set[str]] = {}
     tag_display: dict[str, dict[str, str]] = {}
     tag_to_questions: dict[str, set[str]] = {}
     question_topics: dict[str, str] = {}
 
-    for _, row in df.iterrows():
-        qid = normalize_question_id(str(row["Question ID"]))
-        topic = _raw_value(row.get("Question Topic", ""))
-        if topic:
-            question_topics[qid] = topic
+    tag_cols = [col for col in usecols if col not in {"Question ID", "Question Topic"}]
 
-        tokens: set[str] = set()
-        for col in TAG_SOURCE_COLUMNS:
-            raw = _raw_value(row.get(col, ""))
-            if not raw:
+    for chunk in pd.read_csv(data_link, usecols=usecols, low_memory=True, chunksize=4000):
+        for row in chunk.itertuples(index=False, name=None):
+            row_map = dict(zip(usecols, row))
+            qid = normalize_question_id(str(row_map.get("Question ID", "")))
+            if not qid:
                 continue
-            tokens.add(raw.upper().replace(" ", "_"))
-            for token in raw.split(","):
-                cleaned = token.strip().upper().replace(" ", "_")
-                if cleaned and cleaned != "NAN":
-                    tokens.add(cleaned)
+            topic = _raw_value(row_map.get("Question Topic", ""))
+            if topic:
+                question_topics[qid] = topic
 
-        for col in EXTRA_POTENTIAL_TAG_FIELDS:
-            raw = _raw_value(row.get(col, ""))
-            if not raw:
-                continue
-            tokens.add(raw.upper().replace(" ", "_"))
-            for token in raw.split(","):
-                cleaned = token.strip().upper().replace(" ", "_")
-                if cleaned and cleaned != "NAN":
-                    tokens.add(cleaned)
+            tokens: set[str] = set()
+            for col in tag_cols:
+                raw = _raw_value(row_map.get(col, ""))
+                if not raw:
+                    continue
+                tokens.add(raw.upper().replace(" ", "_"))
+                for token in raw.split(","):
+                    cleaned = token.strip().upper().replace(" ", "_")
+                    if cleaned and cleaned != "NAN":
+                        tokens.add(cleaned)
 
-        tag_index[qid] = tokens
-        for token in tokens:
-            tag_to_questions.setdefault(token, set()).add(qid)
+            for token in tokens:
+                tag_to_questions.setdefault(token, set()).add(qid)
 
-        tag_display[qid] = {
-            "extra_tags": _raw_value(row.get("Extra Tags", "")),
-            "course_tag": _raw_value(row.get("Course Tag of Question", "")),
-            "module_tag": _raw_value(row.get("Module Tag of Question", "")),
-            "unit_tag": _raw_value(row.get("Unit Tag of Question", "")),
-            "grit_tag": _raw_value(row.get("Grit Tag of Question", "")),
-            "all_tags": ", ".join(sorted(tokens)),
-        }
+            if not light:
+                tag_index[qid] = tokens
+                tag_display[qid] = {
+                    "extra_tags": _raw_value(row_map.get("Extra Tags", "")),
+                    "course_tag": _raw_value(row_map.get("Course Tag of Question", "")),
+                    "module_tag": _raw_value(row_map.get("Module Tag of Question", "")),
+                    "unit_tag": _raw_value(row_map.get("Unit Tag of Question", "")),
+                    "grit_tag": _raw_value(row_map.get("Grit Tag of Question", "")),
+                    "all_tags": ", ".join(sorted(tokens)),
+                }
 
     return tag_index, tag_display, tag_to_questions, question_topics
 
@@ -463,6 +468,7 @@ def intent_without_topic_scope(intent: dict) -> dict:
 
 @st.cache_data
 def load_csv_questions_by_id() -> dict[str, pd.Series]:
+    # Kept for compatibility; prefer build_csv_hits_for_ids on small hosts.
     df = pd.read_csv(data_link, low_memory=False)
     by_id: dict[str, pd.Series] = {}
     for _, row in df.iterrows():
@@ -470,6 +476,47 @@ def load_csv_questions_by_id() -> dict[str, pd.Series]:
         if qid:
             by_id[qid] = row
     return by_id
+
+
+_CSV_HIT_COLUMNS = [
+    "Question ID",
+    "Question Topic",
+    "Question Subtopic",
+    "Question Difficulty",
+    "Question Content",
+    "Options Data",
+    "Unit Tag of Question",
+    "Module Tag of Question",
+    "Course Tag of Question",
+    "Grit Tag of Question",
+    "Extra Tags",
+]
+
+
+def build_csv_hits_for_ids(matched_ids: set[str]) -> list[dict]:
+    """Build hits for specific IDs using chunked CSV reads (Render OOM safe)."""
+    if not matched_ids or not data_link:
+        return []
+    header = pd.read_csv(data_link, nrows=0)
+    usecols = [col for col in _CSV_HIT_COLUMNS if col in header.columns]
+    if "Question ID" not in usecols:
+        return []
+
+    hits: list[dict] = []
+    remaining = set(matched_ids)
+    for chunk in pd.read_csv(data_link, usecols=usecols, low_memory=True, chunksize=3000):
+        ids = chunk["Question ID"].astype(str).map(normalize_question_id)
+        mask = ids.isin(remaining)
+        if not mask.any():
+            continue
+        subset = chunk.loc[mask]
+        for rec in subset.to_dict("records"):
+            qid = normalize_question_id(str(rec.get("Question ID", "")))
+            hits.append(build_hit_from_csv_row(pd.Series(rec)))
+            remaining.discard(qid)
+        if not remaining:
+            break
+    return hits
 
 
 def build_hit_from_csv_row(row: pd.Series) -> dict:
@@ -522,8 +569,7 @@ def build_csv_fallback_hits(matched_ids: set[str], found_ids: set[str]) -> list[
     missing = matched_ids - found_ids
     if not missing:
         return []
-    by_id = load_csv_questions_by_id()
-    return [build_hit_from_csv_row(by_id[qid]) for qid in sorted(missing) if qid in by_id]
+    return build_csv_hits_for_ids(missing)
 
 
 TAG_SCROLL_BATCH = 256
@@ -610,9 +656,18 @@ def _fetch_ids_from_collection(client, collection_name: str, needed_ids: set[str
 
 
 def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
-    """Fast tag lookup: topic namespaces first, CSV for questions without topic."""
+    """Tag lookup from CSV first (memory-safe on Render); Pinecone only if CSV unavailable."""
     if not matched_ids:
         return []
+
+    # Small/medium tag sets: CSV-only avoids Pinecone fan-out + full-CSV Series cache OOM.
+    if len(matched_ids) <= 500 and data_link:
+        try:
+            hits = build_csv_hits_for_ids(matched_ids)
+            if hits:
+                return hits
+        except Exception as exc:  # noqa: BLE001
+            print(f"[tag_primary] CSV path failed, trying Pinecone: {exc}", flush=True)
 
     _, _, _, question_topics = load_question_tag_index()
     indexed_ids = {qid for qid in matched_ids if qid in question_topics}
@@ -624,7 +679,9 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
 
     hits: list[dict] = []
     if collection_targets:
-        max_workers = min(8, len(collection_targets))
+        if client is None:
+            client = load_db_client()
+        max_workers = min(4, len(collection_targets))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [
                 pool.submit(_fetch_ids_from_collection, client, collection_name, needed_ids)
@@ -651,8 +708,13 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
 
 @st.cache_data(ttl=900)
 def fetch_cached_tag_primary_hits(tag_signature: str, matched_ids_tuple: tuple[str, ...]) -> list[dict]:
-    client = load_db_client()
-    return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
+    # Avoid creating a second DB client when CSV path can answer the tag query.
+    client = None
+    try:
+        return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
+    except Exception:
+        client = load_db_client()
+        return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
 
 
 SUBTOPIC_QUERY_STOPWORDS = {
@@ -1660,8 +1722,16 @@ def question_has_tags(question_id: str, required_tags: list[str], tag_index: dic
     if not required_tags:
         return True
     qid = normalize_question_id(question_id) if question_id else ""
-    question_tags = tag_index.get(qid, set()) if qid else set()
-    return all(normalize_tag_key(required) in {normalize_tag_key(t) for t in question_tags} for required in required_tags)
+    if not qid:
+        return False
+    if qid in tag_index:
+        question_tags = tag_index[qid]
+        keys = {normalize_tag_key(t) for t in question_tags}
+        return all(normalize_tag_key(required) in keys for required in required_tags)
+    # LIGHT_MEMORY: no per-question tag map — use reverse index
+    _, _, tag_to_questions, _ = load_question_tag_index()
+    required = canonicalize_tags(required_tags, tag_to_questions)
+    return all(qid in tag_to_questions.get(tag, set()) for tag in required)
 
 
 def question_item_has_tags(item: dict, required_tags: list[str], tag_index: dict[str, set[str]]) -> bool:
@@ -1836,6 +1906,12 @@ def needs_strict_filtering(intent: dict) -> bool:
 def rerank_hits_by_similarity(hits: list[dict], query: str, embeddings, limit: int) -> list[dict]:
     if not hits:
         return hits
+
+    # Embedding every hit OOM/timeouts on small hosts (Render). Keep Pinecone/order scores.
+    skip = os.getenv("SKIP_RERANK", "").strip().lower() in {"1", "true", "yes"}
+    if skip or os.getenv("RENDER"):
+        ranked = sorted(hits, key=lambda item: float(item.get("score") or 0), reverse=True)
+        return ranked[:limit]
 
     query_vector = embeddings.embed_query(query)
     batch_size = 64

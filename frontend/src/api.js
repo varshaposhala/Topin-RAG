@@ -37,6 +37,12 @@ export async function searchQuestions(body) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     const detail = formatApiDetail(err.detail);
+    if (res.status === 502 || res.status === 504) {
+      throw new Error(
+        detail ||
+          `Search failed (HTTP ${res.status}). The server ran out of memory or timed out — on Render set EMBEDDINGS_BACKEND=fast and redeploy.`
+      );
+    }
     throw new Error(detail || `Search failed (HTTP ${res.status})`);
   }
   return res.json();

@@ -78,11 +78,16 @@ def health():
 
 @app.on_event("startup")
 def warm_up() -> None:
-    """Warm DB + CSV indexes; embeddings load lazily on first vector search."""
+    """Warm only lightweight catalogs on Render; heavy indexes load lazily."""
     try:
         get_client()
         engine.load_topic_catalog()
-        engine.load_question_tag_index()
+        # Full tag index is large — skip eager load on small hosts.
+        if not (
+            os.getenv("RENDER")
+            or os.getenv("LIGHT_MEMORY", "").strip().lower() in {"1", "true", "yes"}
+        ):
+            engine.load_question_tag_index()
     except Exception as exc:  # noqa: BLE001
         print(f"[warm_up] non-fatal startup warm-up failure: {exc}", flush=True)
 
@@ -128,6 +133,8 @@ def serialize_results(results: list[dict], matched_tags: list[str] | None = None
             parsed.get("question_id") or item.get("metadata", {}).get("question_id", "")
         )
         tags = sorted(tag_index.get(engine.normalize_question_id(qid), set())) if qid else []
+        if not tags:
+            tags = sorted(engine.get_item_tag_tokens(item, tag_index))
         serialized.append(
             {
                 "index": idx,
@@ -150,11 +157,14 @@ def serialize_results(results: list[dict], matched_tags: list[str] | None = None
 
 
 def store_session(intent: dict, results: list[dict], pool: list[dict], query: str) -> str:
+    # Cap memory on small hosts (Render).
+    while len(_SESSIONS) >= 8:
+        _SESSIONS.pop(next(iter(_SESSIONS)))
     session_id = str(uuid.uuid4())
     _SESSIONS[session_id] = {
         "intent": dict(intent),
         "results": results,
-        "result_pool": pool,
+        "result_pool": pool[:500] if pool else pool,
         "shown_ids": {
             engine.get_question_id(item) for item in results if engine.get_question_id(item)
         },
@@ -178,11 +188,6 @@ def catalogs() -> dict:
         "counts": [{"value": v, "label": l} for v, l in engine.COUNT_OPTIONS],
         "difficulties": [{"value": v, "label": l} for v, l in engine.DIFFICULTY_OPTIONS],
     }
-
-
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "service": "topin-question-engine"}
 
 
 @app.get("/api/catalogs")
@@ -215,7 +220,7 @@ def search(payload: SearchRequest):
                     "questions": serialize_results(results, intent.get("tags")),
                     "intent": intent,
                     "session_id": session_id,
-                    "csv": engine.results_to_csv(results, tag_display),
+                    "csv": engine.results_to_csv(results, tag_display) if len(results) <= 200 else "",
                 }
 
     intent = payload.partial_intent or engine.parse_query_intent(query)
@@ -265,7 +270,11 @@ def search(payload: SearchRequest):
     if engine.is_tag_primary_intent(intent) or intent.get("fetch_all"):
         pool = results
     elif engine.intent_has_filters(intent):
-        pool = engine.fetch_pool_for_intent(client, embeddings, intent, query)
+        try:
+            pool = engine.fetch_pool_for_intent(client, embeddings, intent, query)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[search] pool fetch failed, using results: {exc}", flush=True)
+            pool = results
     else:
         pool = results
 
@@ -284,13 +293,19 @@ def search(payload: SearchRequest):
 
     session_id = store_session(intent, results, pool, query)
     _, tag_display, _, _ = engine.load_question_tag_index()
+    csv_text = ""
+    if len(results) <= 200:
+        try:
+            csv_text = engine.results_to_csv(results, tag_display)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[search] csv build failed: {exc}", flush=True)
     return {
         "type": "results",
         "label": intro or label,
         "questions": serialize_results(results, intent.get("tags")),
         "intent": intent,
         "session_id": session_id,
-        "csv": engine.results_to_csv(results, tag_display),
+        "csv": csv_text,
     }
 
 
