@@ -256,6 +256,15 @@ def search(payload: SearchRequest):
             client, embeddings, query, intent_override=intent
         )
     except Exception as exc:
+        if engine.is_pinecone_egress_error(exc):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Pinecone free-tier monthly egress limit (1GB) is exhausted. "
+                    "Tag searches can still work from CSV after redeploy. "
+                    "For semantic search: upgrade Pinecone, or wait until the monthly limit resets."
+                ),
+            ) from exc
         raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
 
     if not results:

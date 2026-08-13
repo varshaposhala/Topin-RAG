@@ -3,6 +3,8 @@ import io
 import json
 import os
 import re
+import urllib.request
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -20,6 +22,7 @@ DEFAULT_RESULT_LIMIT = 15
 MAX_RESULT_LIMIT = 500
 ALL_FETCH_CAP = 2000
 RESULTS_PER_PAGE = 20
+CSV_CACHE_PATH = Path(os.getenv("CSV_CACHE_PATH", "topin_cleaned_data.csv"))
 
 
 def make_db_client() -> PineconeVectorDB:
@@ -308,7 +311,25 @@ def fetch_question_hit_by_id(
 def normalize_tag_key(tag: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(tag).upper())
 
-data_link=st.secrets.get("data_link")
+data_link = st.secrets.get("data_link")
+
+
+def resolve_csv_source() -> str:
+    """Prefer a local CSV cache so we don't re-download ~60MB from S3 every search."""
+    if CSV_CACHE_PATH.exists() and CSV_CACHE_PATH.stat().st_size > 0:
+        return str(CSV_CACHE_PATH)
+    if data_link:
+        try:
+            print(f"[csv] downloading data_link → {CSV_CACHE_PATH}", flush=True)
+            urllib.request.urlretrieve(str(data_link), CSV_CACHE_PATH)
+            if CSV_CACHE_PATH.exists() and CSV_CACHE_PATH.stat().st_size > 0:
+                return str(CSV_CACHE_PATH)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[csv] cache download failed, using remote URL: {exc}", flush=True)
+        return str(data_link)
+    raise FileNotFoundError(
+        "CSV not found. Set data_link or place topin_cleaned_data.csv in the app folder."
+    )
 
 
 def _light_memory_mode() -> bool:
@@ -322,10 +343,10 @@ def _light_memory_mode() -> bool:
 @st.cache_data
 def load_question_tag_index():
     """Build tag catalogs. In LIGHT_MEMORY/RENDER mode, skip per-question maps (OOM-safe)."""
-    if not data_link:
+    if not data_link and not CSV_CACHE_PATH.exists():
         return {}, {}, {}, {}
 
-    header_df = pd.read_csv(data_link, nrows=0)
+    header_df = pd.read_csv(resolve_csv_source(), nrows=0)
     available_cols = set(header_df.columns.tolist())
 
     usecols = ["Question ID", "Question Topic"]
@@ -341,7 +362,7 @@ def load_question_tag_index():
 
     tag_cols = [col for col in usecols if col not in {"Question ID", "Question Topic"}]
 
-    for chunk in pd.read_csv(data_link, usecols=usecols, low_memory=True, chunksize=4000):
+    for chunk in pd.read_csv(resolve_csv_source(), usecols=usecols, low_memory=True, chunksize=4000):
         for row in chunk.itertuples(index=False, name=None):
             row_map = dict(zip(usecols, row))
             qid = normalize_question_id(str(row_map.get("Question ID", "")))
@@ -469,7 +490,7 @@ def intent_without_topic_scope(intent: dict) -> dict:
 @st.cache_data
 def load_csv_questions_by_id() -> dict[str, pd.Series]:
     # Kept for compatibility; prefer build_csv_hits_for_ids on small hosts.
-    df = pd.read_csv(data_link, low_memory=False)
+    df = pd.read_csv(resolve_csv_source(), low_memory=False)
     by_id: dict[str, pd.Series] = {}
     for _, row in df.iterrows():
         qid = normalize_question_id(str(row.get("Question ID", "")))
@@ -495,16 +516,17 @@ _CSV_HIT_COLUMNS = [
 
 def build_csv_hits_for_ids(matched_ids: set[str]) -> list[dict]:
     """Build hits for specific IDs using chunked CSV reads (Render OOM safe)."""
-    if not matched_ids or not data_link:
+    if not matched_ids or not (data_link or CSV_CACHE_PATH.exists()):
         return []
-    header = pd.read_csv(data_link, nrows=0)
+    source = resolve_csv_source()
+    header = pd.read_csv(source, nrows=0)
     usecols = [col for col in _CSV_HIT_COLUMNS if col in header.columns]
     if "Question ID" not in usecols:
         return []
 
     hits: list[dict] = []
     remaining = set(matched_ids)
-    for chunk in pd.read_csv(data_link, usecols=usecols, low_memory=True, chunksize=3000):
+    for chunk in pd.read_csv(source, usecols=usecols, low_memory=True, chunksize=3000):
         ids = chunk["Question ID"].astype(str).map(normalize_question_id)
         mask = ids.isin(remaining)
         if not mask.any():
@@ -517,6 +539,47 @@ def build_csv_hits_for_ids(matched_ids: set[str]) -> list[dict]:
         if not remaining:
             break
     return hits
+
+
+def hydrate_hits_from_csv(hits: list[dict]) -> list[dict]:
+    """Fill question text from local CSV after ID-only Pinecone queries (saves egress)."""
+    if not hits:
+        return hits
+    need: dict[str, int] = {}
+    for idx, hit in enumerate(hits):
+        content = hit.get("content") or ""
+        meta = hit.get("metadata") or {}
+        qid = normalize_question_id(meta.get("question_id", ""))
+        if qid and len(content) < 40:
+            need[qid] = idx
+    if not need:
+        return hits
+    by_id = {
+        normalize_question_id((item.get("metadata") or {}).get("question_id", "")): item
+        for item in build_csv_hits_for_ids(set(need))
+    }
+    out = list(hits)
+    for qid, idx in need.items():
+        src = by_id.get(qid)
+        if not src:
+            continue
+        merged = dict(out[idx])
+        merged["content"] = src.get("content", "")
+        merged["metadata"] = {**(merged.get("metadata") or {}), **(src.get("metadata") or {})}
+        if src.get("collection"):
+            merged["collection"] = src["collection"]
+        out[idx] = merged
+    return out
+
+
+def is_pinecone_egress_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "egress limit" in text
+        or "resource_exhausted" in text
+        or ("429" in text and "egress" in text)
+        or "upgrade your plan" in text
+    )
 
 
 def build_hit_from_csv_row(row: pd.Series) -> dict:
@@ -661,7 +724,7 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
         return []
 
     # Small/medium tag sets: CSV-only avoids Pinecone fan-out + full-CSV Series cache OOM.
-    if len(matched_ids) <= 500 and data_link:
+    if len(matched_ids) <= 500 and (data_link or CSV_CACHE_PATH.exists()):
         try:
             hits = build_csv_hits_for_ids(matched_ids)
             if hits:
@@ -779,7 +842,7 @@ def _subtopic_keyword_variants(suffix: str) -> set[str]:
 @st.cache_data
 def load_subtopic_index():
     df = pd.read_csv(
-        data_link,
+        resolve_csv_source(),
         usecols=["Question Topic", "Question Subtopic"],
         low_memory=False,
     )
@@ -811,7 +874,7 @@ def load_subtopic_index():
 def load_topic_index():
     """Map query keywords to question topics/collections from CSV topic names (e.g. terraform -> topic_terraform_mcq)."""
     df = pd.read_csv(
-        data_link,
+        resolve_csv_source(),
         usecols=["Question Topic"],
         low_memory=False,
     )
@@ -885,7 +948,7 @@ def resolve_topics_from_query(query: str, question_type: str | None = None) -> d
 
 @st.cache_data
 def load_topic_catalog() -> list[str]:
-    df = pd.read_csv(data_link, usecols=["Question Topic"], low_memory=False)
+    df = pd.read_csv(resolve_csv_source(), usecols=["Question Topic"], low_memory=False)
     return sorted({_raw_value(topic) for topic in df["Question Topic"].dropna().unique() if _raw_value(topic)})
 
 
@@ -2427,13 +2490,13 @@ def _search_collections(client, vector, collections, per_collection_limit):
             for point in results.points
         ]
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(search_one, name) for name in collections]
         for future in as_completed(futures):
             hits.extend(future.result())
 
     hits.sort(key=lambda item: item["score"], reverse=True)
-    return hits
+    return hydrate_hits_from_csv(hits)
 
 
 def _fetch_all_from_collections(client, collections: list[str], max_points: int = MAX_RESULT_LIMIT):
@@ -2679,6 +2742,7 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
                 }
                 for point in results.points
             ]
+            hits = hydrate_hits_from_csv(hits)
         else:
             per_collection = max(3, actual_limit // max(len(collections_to_search), 1) + 1)
             hits = _search_collections(client, vector, collections_to_search, per_collection)
@@ -2694,15 +2758,17 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
     if not intent_is_scoped(intent) and client.get_collection("all_questions").points_count > 0:
         db = load_vector_store()
         docs = db.similarity_search(query, k=min(actual_limit, MAX_RESULT_LIMIT))
-        hits = [
-            {
-                "score": 1.0,
-                "content": doc.page_content,
-                "collection": "all_questions",
-                "metadata": doc.metadata or {},
-            }
-            for doc in docs
-        ]
+        hits = hydrate_hits_from_csv(
+            [
+                {
+                    "score": 1.0,
+                    "content": doc.page_content,
+                    "collection": "all_questions",
+                    "metadata": doc.metadata or {},
+                }
+                for doc in docs
+            ]
+        )
         return hits, describe_intent(intent, collections_to_search, len(hits))
 
     per_collection_limit = max(2, actual_limit // 20 + 1)
@@ -2774,6 +2840,7 @@ def fetch_pool_for_intent(client, embeddings, intent: dict, query: str) -> list[
                 }
                 for point in results.points
             ]
+            hits = hydrate_hits_from_csv(hits)
         else:
             per_collection = max(5, cap // max(len(collections_to_search), 1))
             hits = _search_collections(client, vector, collections_to_search, per_collection)

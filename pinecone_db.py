@@ -68,6 +68,16 @@ def _payload_from_metadata(meta: dict | None) -> dict:
     return {"page_content": page_content, "metadata": metadata}
 
 
+def _qid_from_vector_id(vector_id: str) -> str:
+    """Reverse deterministic UUID ids used at upsert time."""
+    import uuid
+
+    try:
+        return uuid.UUID(str(vector_id)).hex
+    except Exception:
+        return str(vector_id).replace("-", "").lower()
+
+
 class PineconeVectorDB:
     """Drop-in replacement for the Qdrant client methods used by the app."""
 
@@ -150,7 +160,9 @@ class PineconeVectorDB:
             "vector": list(query),
             "top_k": max(1, int(limit)),
             "namespace": self.namespace,
-            "include_metadata": bool(with_payload),
+            # IDs + scores only — full metadata/page_content burns Pinecone free egress (1GB/mo).
+            "include_metadata": False,
+            "include_values": False,
         }
         if collection_name and collection_name != "all_questions":
             query_kwargs["filter"] = {"collection": {"$eq": collection_name}}
@@ -162,16 +174,14 @@ class PineconeVectorDB:
             if isinstance(match, dict):
                 mid = match.get("id")
                 score = float(match.get("score") or 0.0)
-                meta = match.get("metadata") or {}
             else:
                 mid = getattr(match, "id", None)
                 score = float(getattr(match, "score", 0.0) or 0.0)
-                meta = getattr(match, "metadata", None) or {}
             points.append(
                 PineconePoint(
                     id=str(mid),
                     score=score,
-                    payload=_payload_from_metadata(meta),
+                    payload={"page_content": "", "metadata": {"question_id": _qid_from_vector_id(str(mid))}},
                 )
             )
         return QueryResult(points=points)
