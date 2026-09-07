@@ -1,0 +1,12 @@
+# Slim production deps for Render/Docker (no torch / sentence-transformers / Streamlit).
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
+python-multipart>=0.0.9
+pandas
+pinecone
+httpx>=0.27.0
+openai>=1.40.0
+numpy==1.26.4
+huggingface_hub>=0.24.0
+fastembed>=0.4.0

@@ -1,6 +1,6 @@
 # Topin Global Question Engine
 
-A Streamlit-based search interface for educational questions powered by Qdrant and Hugging Face embeddings.
+A Streamlit-based search interface for educational questions powered by Pinecone and Hugging Face embeddings.
 
 ## Overview
 
@@ -13,6 +13,8 @@ This app enables natural-language question search across a question bank. It sup
 ## Files
 
 - `app.py` - main Streamlit application
+- `pinecone_db.py` - Pinecone database adapter
+- `reindex_pinecone.py` - upload CSV questions into Pinecone
 - `requirements.txt` - Python dependencies
 - `topin_cleaned_data.csv` - source dataset used by the question index
 
@@ -20,7 +22,7 @@ This app enables natural-language question search across a question bank. It sup
 
 - Python 3.10+ installed
 - `pip` for package installation
-- Qdrant instance accessible via `QDRANT_URL` and `QDRANT_API_KEY`
+- Pinecone account + API key (`PINECONE_API_KEY`)
 - Optional: `HF_TOKEN` for Hugging Face model access if rate limits are needed
 - Optional: `OPENROUTER_API_KEY` if the app uses OpenRouter for intent parsing
 
@@ -48,33 +50,36 @@ pip install -r requirements.txt
 
 ## Configuration
 
-The app reads secrets from Streamlit secrets or environment variables. Create a file at `.streamlit/secrets.toml` or set environment variables directly.
-
-Example `.streamlit/secrets.toml`:
+Create `.streamlit/secrets.toml`:
 
 ```toml
-QDRANT_URL = "https://your-qdrant-instance"
-QDRANT_API_KEY = "your-qdrant-api-key"
+PINECONE_API_KEY = "your-pinecone-api-key"
+PINECONE_INDEX_NAME = "topin-questions"
+PINECONE_CLOUD = "aws"
+PINECONE_REGION = "us-east-1"
 OPENROUTER_API_KEY = "your-openrouter-api-key"
-HF_TOKEN = "your-huggingface-token"
+data_link = "https://your-csv-url/topin_cleaned_data.csv"
 ```
 
-If you prefer environment variables, set:
+## Load data into Pinecone
 
-- `QDRANT_URL`
-- `QDRANT_API_KEY`
-- `OPENROUTER_API_KEY`
-- `HF_TOKEN`
+```bash
+python -u reindex_pinecone.py
+```
 
-## Run the App
+Test with a small sample first:
 
-Start the Streamlit app with:
+```bash
+python -u reindex_pinecone.py --limit 200
+```
+
+Then start the app:
 
 ```bash
 streamlit run app.py
 ```
 
-Then open the local URL shown in the terminal.
+`topin_cleaned_data.csv` is the source of truth. If Pinecone data is lost, re-run the reindex script.
 
 ## Usage
 
@@ -110,10 +115,10 @@ Structured tags and curriculum tags are extracted from the query only when they 
 The parsed subject, question type, difficulty, count, tags, and topic keywords are combined into a single intent object. This object describes exactly what the user wants.
 
 ### 5. Collection selection
-Using the intent, the app selects the appropriate Qdrant collections to search. For example, a `python coding` request will target `topic_python_coding` and related Python collections, while `sql mcqs` will target SQL MCQ collections.
+Using the intent, the app selects the appropriate Pinecone namespaces to search. For example, a `python coding` request will target `topic_python_coding_questions` and related Python namespaces, while `sql mcqs` will target SQL MCQ namespaces.
 
 ### 6. Semantic search with embeddings
-If the query is not purely tag-based, the app uses Hugging Face embeddings to convert the query into a vector and compares it against stored question vectors in Qdrant. This finds the most relevant rows even when the query wording differs from the exact stored text.
+If the query is not purely tag-based, the app uses Hugging Face embeddings to convert the query into a vector and compares it against stored question vectors in Pinecone. This finds the most relevant rows even when the query wording differs from the exact stored text.
 
 ### 7. Result filtering and ranking
 The app filters matched rows by the detected intent fields and ranks them by relevance. This ensures returned questions match the subject/type and are the best semantic fit.
@@ -125,7 +130,7 @@ This detailed pipeline ensures subject-wise, tag-wise, and field-wise searches w
 
 ## Notes
 
-- The app relies on Qdrant collections, so make sure your Qdrant instance is reachable and populated.
+- The app relies on a populated Pinecone index, so make sure `PINECONE_API_KEY` is set and `reindex_pinecone.py` has been run.
 - Query parsing supports subject and tag filters, but accuracy depends on matching data in the CSV index.
 
 

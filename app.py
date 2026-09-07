@@ -3,24 +3,35 @@ import io
 import json
 import os
 import re
+import urllib.request
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qdrant_models
+from pinecone_db import PineconeVectorDB, SimpleVectorStore
 
 st.set_page_config(page_title="Topin Global Search", page_icon="🤖", layout="wide")
 st.title("🤖 Topin Global Question Engine")
-QDRANT_URL = st.secrets.get("QDRANT_URL")
-QDRANT_API_KEY = st.secrets.get("QDRANT_API_KEY")
+PINECONE_API_KEY = st.secrets.get("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = st.secrets.get("PINECONE_INDEX_NAME") or "topin-questions"
+PINECONE_CLOUD = st.secrets.get("PINECONE_CLOUD") or "aws"
+PINECONE_REGION = st.secrets.get("PINECONE_REGION") or "us-east-1"
 DEFAULT_RESULT_LIMIT = 15
 MAX_RESULT_LIMIT = 500
 ALL_FETCH_CAP = 2000
 RESULTS_PER_PAGE = 20
+CSV_CACHE_PATH = Path(os.getenv("CSV_CACHE_PATH", "topin_cleaned_data.csv"))
+
+
+def make_db_client() -> PineconeVectorDB:
+    return PineconeVectorDB(
+        api_key=PINECONE_API_KEY,
+        index_name=PINECONE_INDEX_NAME,
+        cloud=PINECONE_CLOUD,
+        region=PINECONE_REGION,
+    )
 
 SUBJECT_ALIASES = [
     ("html/css", "html_css"),
@@ -248,7 +259,7 @@ def fetch_question_hit_by_id(
     question_id: str,
     topics: list[str] | None = None,
 ) -> dict | None:
-    """Fetch a single question payload from Qdrant by normalized question ID."""
+    """Fetch a single question payload from Pinecone by normalized question ID."""
     _, _, _, question_topics = load_question_tag_index()
     target = normalize_question_id(question_id)
     if not target:
@@ -300,68 +311,91 @@ def fetch_question_hit_by_id(
 def normalize_tag_key(tag: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(tag).upper())
 
-data_link=st.secrets.get("data_link")
+data_link = st.secrets.get("data_link")
+
+
+def resolve_csv_source() -> str:
+    """Prefer a local CSV cache so we don't re-download ~60MB from S3 every search."""
+    if CSV_CACHE_PATH.exists() and CSV_CACHE_PATH.stat().st_size > 0:
+        return str(CSV_CACHE_PATH)
+    if data_link:
+        try:
+            print(f"[csv] downloading data_link → {CSV_CACHE_PATH}", flush=True)
+            urllib.request.urlretrieve(str(data_link), CSV_CACHE_PATH)
+            if CSV_CACHE_PATH.exists() and CSV_CACHE_PATH.stat().st_size > 0:
+                return str(CSV_CACHE_PATH)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[csv] cache download failed, using remote URL: {exc}", flush=True)
+        return str(data_link)
+    raise FileNotFoundError(
+        "CSV not found. Set data_link or place topin_cleaned_data.csv in the app folder."
+    )
+
+
+def _light_memory_mode() -> bool:
+    return os.getenv("RENDER") is not None or os.getenv("LIGHT_MEMORY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 @st.cache_data
 def load_question_tag_index():
-    # Read CSV header first to detect which tag-like columns actually exist
-    header_df = pd.read_csv(data_link, nrows=0)
+    """Build tag catalogs. In LIGHT_MEMORY/RENDER mode, skip per-question maps (OOM-safe)."""
+    if not data_link and not CSV_CACHE_PATH.exists():
+        return {}, {}, {}, {}
+
+    header_df = pd.read_csv(resolve_csv_source(), nrows=0)
     available_cols = set(header_df.columns.tolist())
 
-    # Build effective usecols: always include Question ID and Question Topic
     usecols = ["Question ID", "Question Topic"]
     for col in list(TAG_SOURCE_COLUMNS) + EXTRA_POTENTIAL_TAG_FIELDS:
         if col in available_cols and col not in usecols:
             usecols.append(col)
 
-    df = pd.read_csv(
-        data_link,
-        usecols=usecols,
-        low_memory=False,
-    )
+    light = _light_memory_mode()
     tag_index: dict[str, set[str]] = {}
     tag_display: dict[str, dict[str, str]] = {}
     tag_to_questions: dict[str, set[str]] = {}
     question_topics: dict[str, str] = {}
 
-    for _, row in df.iterrows():
-        qid = normalize_question_id(str(row["Question ID"]))
-        topic = _raw_value(row.get("Question Topic", ""))
-        if topic:
-            question_topics[qid] = topic
+    tag_cols = [col for col in usecols if col not in {"Question ID", "Question Topic"}]
 
-        tokens: set[str] = set()
-        for col in TAG_SOURCE_COLUMNS:
-            raw = _raw_value(row.get(col, ""))
-            if not raw:
+    for chunk in pd.read_csv(resolve_csv_source(), usecols=usecols, low_memory=True, chunksize=4000):
+        for row in chunk.itertuples(index=False, name=None):
+            row_map = dict(zip(usecols, row))
+            qid = normalize_question_id(str(row_map.get("Question ID", "")))
+            if not qid:
                 continue
-            tokens.add(raw.upper().replace(" ", "_"))
-            for token in raw.split(","):
-                cleaned = token.strip().upper().replace(" ", "_")
-                if cleaned and cleaned != "NAN":
-                    tokens.add(cleaned)
+            topic = _raw_value(row_map.get("Question Topic", ""))
+            if topic:
+                question_topics[qid] = topic
 
-        for col in EXTRA_POTENTIAL_TAG_FIELDS:
-            raw = _raw_value(row.get(col, ""))
-            if not raw:
-                continue
-            tokens.add(raw.upper().replace(" ", "_"))
-            for token in raw.split(","):
-                cleaned = token.strip().upper().replace(" ", "_")
-                if cleaned and cleaned != "NAN":
-                    tokens.add(cleaned)
+            tokens: set[str] = set()
+            for col in tag_cols:
+                raw = _raw_value(row_map.get(col, ""))
+                if not raw:
+                    continue
+                tokens.add(raw.upper().replace(" ", "_"))
+                for token in raw.split(","):
+                    cleaned = token.strip().upper().replace(" ", "_")
+                    if cleaned and cleaned != "NAN":
+                        tokens.add(cleaned)
 
-        tag_index[qid] = tokens
-        for token in tokens:
-            tag_to_questions.setdefault(token, set()).add(qid)
+            for token in tokens:
+                tag_to_questions.setdefault(token, set()).add(qid)
 
-        tag_display[qid] = {
-            "extra_tags": _raw_value(row.get("Extra Tags", "")),
-            "course_tag": _raw_value(row.get("Course Tag of Question", "")),
-            "module_tag": _raw_value(row.get("Module Tag of Question", "")),
-            "unit_tag": _raw_value(row.get("Unit Tag of Question", "")),
-            "grit_tag": _raw_value(row.get("Grit Tag of Question", "")),
-            "all_tags": ", ".join(sorted(tokens)),
-        }
+            if not light:
+                tag_index[qid] = tokens
+                tag_display[qid] = {
+                    "extra_tags": _raw_value(row_map.get("Extra Tags", "")),
+                    "course_tag": _raw_value(row_map.get("Course Tag of Question", "")),
+                    "module_tag": _raw_value(row_map.get("Module Tag of Question", "")),
+                    "unit_tag": _raw_value(row_map.get("Unit Tag of Question", "")),
+                    "grit_tag": _raw_value(row_map.get("Grit Tag of Question", "")),
+                    "all_tags": ", ".join(sorted(tokens)),
+                }
 
     return tag_index, tag_display, tag_to_questions, question_topics
 
@@ -455,13 +489,97 @@ def intent_without_topic_scope(intent: dict) -> dict:
 
 @st.cache_data
 def load_csv_questions_by_id() -> dict[str, pd.Series]:
-    df = pd.read_csv(data_link, low_memory=False)
+    # Kept for compatibility; prefer build_csv_hits_for_ids on small hosts.
+    df = pd.read_csv(resolve_csv_source(), low_memory=False)
     by_id: dict[str, pd.Series] = {}
     for _, row in df.iterrows():
         qid = normalize_question_id(str(row.get("Question ID", "")))
         if qid:
             by_id[qid] = row
     return by_id
+
+
+_CSV_HIT_COLUMNS = [
+    "Question ID",
+    "Question Topic",
+    "Question Subtopic",
+    "Question Difficulty",
+    "Question Content",
+    "Options Data",
+    "Unit Tag of Question",
+    "Module Tag of Question",
+    "Course Tag of Question",
+    "Grit Tag of Question",
+    "Extra Tags",
+]
+
+
+def build_csv_hits_for_ids(matched_ids: set[str]) -> list[dict]:
+    """Build hits for specific IDs using chunked CSV reads (Render OOM safe)."""
+    if not matched_ids or not (data_link or CSV_CACHE_PATH.exists()):
+        return []
+    source = resolve_csv_source()
+    header = pd.read_csv(source, nrows=0)
+    usecols = [col for col in _CSV_HIT_COLUMNS if col in header.columns]
+    if "Question ID" not in usecols:
+        return []
+
+    hits: list[dict] = []
+    remaining = set(matched_ids)
+    for chunk in pd.read_csv(source, usecols=usecols, low_memory=True, chunksize=3000):
+        ids = chunk["Question ID"].astype(str).map(normalize_question_id)
+        mask = ids.isin(remaining)
+        if not mask.any():
+            continue
+        subset = chunk.loc[mask]
+        for rec in subset.to_dict("records"):
+            qid = normalize_question_id(str(rec.get("Question ID", "")))
+            hits.append(build_hit_from_csv_row(pd.Series(rec)))
+            remaining.discard(qid)
+        if not remaining:
+            break
+    return hits
+
+
+def hydrate_hits_from_csv(hits: list[dict]) -> list[dict]:
+    """Fill question text from local CSV after ID-only Pinecone queries (saves egress)."""
+    if not hits:
+        return hits
+    need: dict[str, int] = {}
+    for idx, hit in enumerate(hits):
+        content = hit.get("content") or ""
+        meta = hit.get("metadata") or {}
+        qid = normalize_question_id(meta.get("question_id", ""))
+        if qid and len(content) < 40:
+            need[qid] = idx
+    if not need:
+        return hits
+    by_id = {
+        normalize_question_id((item.get("metadata") or {}).get("question_id", "")): item
+        for item in build_csv_hits_for_ids(set(need))
+    }
+    out = list(hits)
+    for qid, idx in need.items():
+        src = by_id.get(qid)
+        if not src:
+            continue
+        merged = dict(out[idx])
+        merged["content"] = src.get("content", "")
+        merged["metadata"] = {**(merged.get("metadata") or {}), **(src.get("metadata") or {})}
+        if src.get("collection"):
+            merged["collection"] = src["collection"]
+        out[idx] = merged
+    return out
+
+
+def is_pinecone_egress_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "egress limit" in text
+        or "resource_exhausted" in text
+        or ("429" in text and "egress" in text)
+        or "upgrade your plan" in text
+    )
 
 
 def build_hit_from_csv_row(row: pd.Series) -> dict:
@@ -514,8 +632,7 @@ def build_csv_fallback_hits(matched_ids: set[str], found_ids: set[str]) -> list[
     missing = matched_ids - found_ids
     if not missing:
         return []
-    by_id = load_csv_questions_by_id()
-    return [build_hit_from_csv_row(by_id[qid]) for qid in sorted(missing) if qid in by_id]
+    return build_csv_hits_for_ids(missing)
 
 
 TAG_SCROLL_BATCH = 256
@@ -535,9 +652,35 @@ def _extract_qid_from_point_payload(metadata: dict, content: str) -> str:
     return qid
 
 
+def point_uuid_from_question_id(qid: str) -> str:
+    import uuid
+
+    cleaned = normalize_question_id(qid)
+    if len(cleaned) == 32:
+        return str(uuid.UUID(cleaned))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, cleaned or "empty"))
+
+
 def _fetch_ids_from_collection(client, collection_name: str, needed_ids: set[str]) -> list[dict]:
     if not needed_ids:
         return []
+
+    # Fast path for Pinecone: fetch by deterministic vector IDs
+    if hasattr(client, "fetch_ids"):
+        vector_ids = [point_uuid_from_question_id(qid) for qid in needed_ids]
+        points = client.fetch_ids(collection_name, vector_ids)
+        hits = []
+        for point in points:
+            payload = point.payload or {}
+            hits.append(
+                {
+                    "score": 1.0,
+                    "content": payload.get("page_content", ""),
+                    "collection": collection_name,
+                    "metadata": payload.get("metadata", {}) or {},
+                }
+            )
+        return hits
 
     remaining = set(needed_ids)
     hits: list[dict] = []
@@ -576,21 +719,32 @@ def _fetch_ids_from_collection(client, collection_name: str, needed_ids: set[str
 
 
 def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
-    """Fast tag lookup: only scan collections known from CSV, CSV-only for questions without topic."""
+    """Tag lookup from CSV first (memory-safe on Render); Pinecone only if CSV unavailable."""
     if not matched_ids:
         return []
 
+    # Small/medium tag sets: CSV-only avoids Pinecone fan-out + full-CSV Series cache OOM.
+    if len(matched_ids) <= 500 and (data_link or CSV_CACHE_PATH.exists()):
+        try:
+            hits = build_csv_hits_for_ids(matched_ids)
+            if hits:
+                return hits
+        except Exception as exc:  # noqa: BLE001
+            print(f"[tag_primary] CSV path failed, trying Pinecone: {exc}", flush=True)
+
     _, _, _, question_topics = load_question_tag_index()
-    qdrant_ids = {qid for qid in matched_ids if qid in question_topics}
-    csv_only_ids = matched_ids - qdrant_ids
+    indexed_ids = {qid for qid in matched_ids if qid in question_topics}
+    csv_only_ids = matched_ids - indexed_ids
 
     collection_targets: dict[str, set[str]] = {}
-    for qid in qdrant_ids:
+    for qid in indexed_ids:
         collection_targets.setdefault(f"{question_topics[qid]}_questions", set()).add(qid)
 
     hits: list[dict] = []
     if collection_targets:
-        max_workers = min(8, len(collection_targets))
+        if client is None:
+            client = load_db_client()
+        max_workers = min(4, len(collection_targets))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [
                 pool.submit(_fetch_ids_from_collection, client, collection_name, needed_ids)
@@ -608,17 +762,22 @@ def _fetch_tag_primary_hits(client, matched_ids: set[str]) -> list[dict]:
         for qid in [_extract_qid_from_point_payload(hit.get("metadata") or {}, hit.get("content", ""))]
         if qid
     }
-    missing_qdrant = qdrant_ids - found_ids
-    if missing_qdrant:
-        hits.extend(build_csv_fallback_hits(missing_qdrant, set()))
+    missing_indexed = indexed_ids - found_ids
+    if missing_indexed:
+        hits.extend(build_csv_fallback_hits(missing_indexed, set()))
 
     return hits
 
 
 @st.cache_data(ttl=900)
 def fetch_cached_tag_primary_hits(tag_signature: str, matched_ids_tuple: tuple[str, ...]) -> list[dict]:
-    client = load_qdrant_client()
-    return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
+    # Avoid creating a second DB client when CSV path can answer the tag query.
+    client = None
+    try:
+        return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
+    except Exception:
+        client = load_db_client()
+        return _fetch_tag_primary_hits(client, set(matched_ids_tuple))
 
 
 SUBTOPIC_QUERY_STOPWORDS = {
@@ -683,7 +842,7 @@ def _subtopic_keyword_variants(suffix: str) -> set[str]:
 @st.cache_data
 def load_subtopic_index():
     df = pd.read_csv(
-        data_link,
+        resolve_csv_source(),
         usecols=["Question Topic", "Question Subtopic"],
         low_memory=False,
     )
@@ -715,7 +874,7 @@ def load_subtopic_index():
 def load_topic_index():
     """Map query keywords to question topics/collections from CSV topic names (e.g. terraform -> topic_terraform_mcq)."""
     df = pd.read_csv(
-        data_link,
+        resolve_csv_source(),
         usecols=["Question Topic"],
         low_memory=False,
     )
@@ -789,7 +948,7 @@ def resolve_topics_from_query(query: str, question_type: str | None = None) -> d
 
 @st.cache_data
 def load_topic_catalog() -> list[str]:
-    df = pd.read_csv(data_link, usecols=["Question Topic"], low_memory=False)
+    df = pd.read_csv(resolve_csv_source(), usecols=["Question Topic"], low_memory=False)
     return sorted({_raw_value(topic) for topic in df["Question Topic"].dropna().unique() if _raw_value(topic)})
 
 
@@ -1626,8 +1785,16 @@ def question_has_tags(question_id: str, required_tags: list[str], tag_index: dic
     if not required_tags:
         return True
     qid = normalize_question_id(question_id) if question_id else ""
-    question_tags = tag_index.get(qid, set()) if qid else set()
-    return all(normalize_tag_key(required) in {normalize_tag_key(t) for t in question_tags} for required in required_tags)
+    if not qid:
+        return False
+    if qid in tag_index:
+        question_tags = tag_index[qid]
+        keys = {normalize_tag_key(t) for t in question_tags}
+        return all(normalize_tag_key(required) in keys for required in required_tags)
+    # LIGHT_MEMORY: no per-question tag map — use reverse index
+    _, _, tag_to_questions, _ = load_question_tag_index()
+    required = canonicalize_tags(required_tags, tag_to_questions)
+    return all(qid in tag_to_questions.get(tag, set()) for tag in required)
 
 
 def question_item_has_tags(item: dict, required_tags: list[str], tag_index: dict[str, set[str]]) -> bool:
@@ -1803,6 +1970,12 @@ def rerank_hits_by_similarity(hits: list[dict], query: str, embeddings, limit: i
     if not hits:
         return hits
 
+    # Embedding every hit OOM/timeouts on small hosts (Render). Keep Pinecone/order scores.
+    skip = os.getenv("SKIP_RERANK", "").strip().lower() in {"1", "true", "yes"}
+    if skip or os.getenv("RENDER"):
+        ranked = sorted(hits, key=lambda item: float(item.get("score") or 0), reverse=True)
+        return ranked[:limit]
+
     query_vector = embeddings.embed_query(query)
     batch_size = 64
     scored: list[dict] = []
@@ -1820,41 +1993,63 @@ def rerank_hits_by_similarity(hits: list[dict], query: str, embeddings, limit: i
 
 @st.cache_resource
 def load_embeddings():
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    """Local MiniLM embeddings — matches Pinecone index vectors (384-dim)."""
+    from sentence_transformers import SentenceTransformer
+
+    class _LocalEmbeddings:
+        def __init__(self):
+            self.model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+        def embed_query(self, text: str) -> list[float]:
+            return [float(x) for x in self.model.encode(text, normalize_embeddings=True)]
+
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            if not texts:
+                return []
+            vectors = self.model.encode(texts, normalize_embeddings=True, batch_size=32)
+            return [[float(x) for x in row] for row in vectors]
+
+    return _LocalEmbeddings()
 
 
 @st.cache_resource
-def load_qdrant_client():
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=20)
-
+def load_db_client():
+    client = make_db_client()
+    # Namespace is created on first upsert; keep call for compatibility.
     if not client.collection_exists(collection_name="all_questions"):
-        client.create_collection(
-            collection_name="all_questions",
-            vectors_config=qdrant_models.VectorParams(
-                size=384,
-                distance=qdrant_models.Distance.COSINE,
-            ),
-        )
+        client.create_collection(collection_name="all_questions")
     return client
 
 
 @st.cache_resource
 def load_vector_store():
-    return QdrantVectorStore(
-        client=load_qdrant_client(),
+    return SimpleVectorStore(
+        client=load_db_client(),
+        embeddings=load_embeddings(),
         collection_name="all_questions",
-        embedding=load_embeddings(),
     )
 
 
 @st.cache_data(ttl=300)
-def get_searchable_collections(qdrant_url: str, api_key: str):
-    client = QdrantClient(url=qdrant_url, api_key=api_key, timeout=20)
-    return [
-        col.name
-        for col in client.get_collections().collections
-        if col.name.endswith("_questions") and col.name != "all_questions"
-    ]
+def get_searchable_collections(storage_key: str = ""):
+    """List topic collections from CSV (Pinecone free tier uses one namespace)."""
+    _ = storage_key or (PINECONE_INDEX_NAME or "default")
+    topics = load_topic_catalog()
+    collections = [f"{topic}_questions" if not topic.endswith("_questions") else topic for topic in topics]
+    collections.extend(["unassigned_mcq_questions", "unassigned_coding_questions"])
+    return sorted(set(collections))
+
+
+def _count_available_points(client, collections: list[str]) -> int:
+    _, _, _, question_topics = load_question_tag_index()
+    from collections import Counter
+
+    counts = Counter(f"{topic}_questions" for topic in question_topics.values())
+    # Questions without topic are not in question_topics; approximate via client if provided
+    total = sum(counts.get(name, 0) for name in collections)
+    if total:
+        return total
+    return sum(client.get_collection(name).points_count for name in collections)
 
 
 def parse_result_limit(query: str) -> tuple[int | None, bool]:
@@ -2295,17 +2490,13 @@ def _search_collections(client, vector, collections, per_collection_limit):
             for point in results.points
         ]
 
-    with ThreadPoolExecutor(max_workers=16) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(search_one, name) for name in collections]
         for future in as_completed(futures):
             hits.extend(future.result())
 
     hits.sort(key=lambda item: item["score"], reverse=True)
-    return hits
-
-
-def _count_available_points(client, collections: list[str]) -> int:
-    return sum(client.get_collection(name).points_count for name in collections)
+    return hydrate_hits_from_csv(hits)
 
 
 def _fetch_all_from_collections(client, collections: list[str], max_points: int = MAX_RESULT_LIMIT):
@@ -2459,7 +2650,7 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
     if intent.get("has_explicit_count") and intent.get("limit") == 1:
         fetch_all = False
 
-    all_collections = get_searchable_collections(QDRANT_URL, QDRANT_API_KEY)
+    all_collections = get_searchable_collections()
     if tag_primary and required_tags:
         collections_to_search = [name for name in tag_collections if name in all_collections]
     else:
@@ -2551,6 +2742,7 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
                 }
                 for point in results.points
             ]
+            hits = hydrate_hits_from_csv(hits)
         else:
             per_collection = max(3, actual_limit // max(len(collections_to_search), 1) + 1)
             hits = _search_collections(client, vector, collections_to_search, per_collection)
@@ -2566,15 +2758,17 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
     if not intent_is_scoped(intent) and client.get_collection("all_questions").points_count > 0:
         db = load_vector_store()
         docs = db.similarity_search(query, k=min(actual_limit, MAX_RESULT_LIMIT))
-        hits = [
-            {
-                "score": 1.0,
-                "content": doc.page_content,
-                "collection": "all_questions",
-                "metadata": doc.metadata or {},
-            }
-            for doc in docs
-        ]
+        hits = hydrate_hits_from_csv(
+            [
+                {
+                    "score": 1.0,
+                    "content": doc.page_content,
+                    "collection": "all_questions",
+                    "metadata": doc.metadata or {},
+                }
+                for doc in docs
+            ]
+        )
         return hits, describe_intent(intent, collections_to_search, len(hits))
 
     per_collection_limit = max(2, actual_limit // 20 + 1)
@@ -2586,7 +2780,7 @@ def search_all_collections(client, embeddings, query, intent_override: dict | No
 def fetch_pool_for_intent(client, embeddings, intent: dict, query: str) -> list[dict]:
     """Return all questions matching intent (used for 'give me more' follow-ups)."""
     tag_index, _, _tag_to_questions, _question_topics = load_question_tag_index()
-    all_collections = get_searchable_collections(QDRANT_URL, QDRANT_API_KEY)
+    all_collections = get_searchable_collections()
     required_tags = intent.get("tags") or []
     matched_ids: set[str] = set()
     tag_collections: list[str] = []
@@ -2646,6 +2840,7 @@ def fetch_pool_for_intent(client, embeddings, intent: dict, query: str) -> list[
                 }
                 for point in results.points
             ]
+            hits = hydrate_hits_from_csv(hits)
         else:
             per_collection = max(5, cap // max(len(collections_to_search), 1))
             hits = _search_collections(client, vector, collections_to_search, per_collection)
@@ -3316,7 +3511,7 @@ def run_search_and_store(client, embeddings, intent: dict, original_query: str) 
 
     if not results:
         collections = filter_collections(
-            get_searchable_collections(QDRANT_URL, QDRANT_API_KEY),
+            get_searchable_collections(),
             intent,
         )
         response = generate_search_intro_llm(
@@ -3340,161 +3535,165 @@ def run_search_and_store(client, embeddings, intent: dict, original_query: str) 
     append_assistant_results(results, search_label, intent, pool, query)
 
 
-try:
-    client = load_qdrant_client()
-    embeddings = load_embeddings()
-except Exception as exc:
-    st.error(f"Failed to connect to the database: {exc}")
-    st.stop()
+# When imported by FastAPI, skip Streamlit UI bootstrap.
+if os.environ.get("TOPIN_API_MODE") == "1":
+    pass
+else:
+    try:
+        client = load_db_client()
+        embeddings = load_embeddings()
+    except Exception as exc:
+        st.error(f"Failed to connect to the database: {exc}")
+        st.stop()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-if "search_context" not in st.session_state:
-    st.session_state.search_context = None
+    if "search_context" not in st.session_state:
+        st.session_state.search_context = None
 
-if st.session_state.get("execute_search"):
-    payload = st.session_state.pop("execute_search")
-    with st.spinner("Searching Topin database..."):
-        try:
-            run_search_and_store(client, embeddings, payload["intent"], payload["query"])
-        except Exception as exc:
-            st.session_state.messages.append(
-                {"role": "assistant", "content": f"Search failed: {exc}"}
-            )
-    st.rerun()
+    if st.session_state.get("execute_search"):
+        payload = st.session_state.pop("execute_search")
+        with st.spinner("Searching Topin database..."):
+            try:
+                run_search_and_store(client, embeddings, payload["intent"], payload["query"])
+            except Exception as exc:
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": f"Search failed: {exc}"}
+                )
+        st.rerun()
 
-for msg_index, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        if message["role"] == "assistant" and message.get("results") is not None:
-            render_results(
-                message["results"],
-                message.get("search_label", ""),
-                f"history_{msg_index}",
-                matched_tags=message.get("matched_tags"),
-            )
-        elif message.get("selection_prompt"):
-            render_selection_prompt(
-                message.get("content", ""),
-                message.get("partial_intent", {}),
-                message.get("original_query", ""),
-                f"history_{msg_index}",
-            )
-        else:
-            st.markdown(message.get("content", ""))
-
-if user_query := st.chat_input(
-    "Ask naturally — e.g. 'all python coding SET_1 questions' or 'give me git mcqs'"
-):
-    restore_search_context_from_messages()
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
-
-    query_intent = parse_query_intent(user_query)
-    context = st.session_state.search_context
-    follow_up = handle_follow_up(user_query, context) if context else None
-
-    with st.chat_message("assistant"):
-        if follow_up is not None:
-            results, search_label = follow_up
-            message_key = f"live_{len(st.session_state.messages)}"
-            response = render_results(
-                results,
-                search_label,
-                message_key,
-                matched_tags=context.get("intent", {}).get("tags"),
-            )
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                    "search_label": search_label,
-                    "results": results,
-                    "matched_tags": context.get("intent", {}).get("tags"),
-                }
-            )
-        else:
-            needs_selection, prompt_message = requires_subject_type_selection(user_query, query_intent)
-            if context and is_context_refinement_query(user_query, context):
-                needs_selection = False
-
-            if needs_selection:
+    for msg_index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant" and message.get("results") is not None:
+                render_results(
+                    message["results"],
+                    message.get("search_label", ""),
+                    f"history_{msg_index}",
+                    matched_tags=message.get("matched_tags"),
+                )
+            elif message.get("selection_prompt"):
                 render_selection_prompt(
-                    prompt_message,
-                    query_intent,
-                    user_query,
-                    f"live_{len(st.session_state.messages)}",
+                    message.get("content", ""),
+                    message.get("partial_intent", {}),
+                    message.get("original_query", ""),
+                    f"history_{msg_index}",
+                )
+            else:
+                st.markdown(message.get("content", ""))
+
+    if user_query := st.chat_input(
+        "Ask naturally — e.g. 'all python coding SET_1 questions' or 'give me git mcqs'"
+    ):
+        restore_search_context_from_messages()
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        query_intent = parse_query_intent(user_query)
+        context = st.session_state.search_context
+        follow_up = handle_follow_up(user_query, context) if context else None
+
+        with st.chat_message("assistant"):
+            if follow_up is not None:
+                results, search_label = follow_up
+                message_key = f"live_{len(st.session_state.messages)}"
+                response = render_results(
+                    results,
+                    search_label,
+                    message_key,
+                    matched_tags=context.get("intent", {}).get("tags"),
                 )
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "content": prompt_message,
-                        "selection_prompt": True,
-                        "partial_intent": query_intent,
-                        "original_query": user_query,
+                        "content": response,
+                        "search_label": search_label,
+                        "results": results,
+                        "matched_tags": context.get("intent", {}).get("tags"),
                     }
                 )
-            elif context and is_context_refinement_query(user_query, context):
-                response = (
-                    "I could not apply that filter to your current question list. "
-                    "Try: `only SUB_TOPIC_GIT_BASICS subtopic questions`"
-                )
-                st.markdown(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
             else:
-                with st.spinner("Searching Topin database..."):
-                    try:
-                        results, search_label = search_all_collections(
-                            client, embeddings, user_query, intent_override=query_intent
-                        )
-                        if not results:
-                            collections = filter_collections(
-                                get_searchable_collections(QDRANT_URL, QDRANT_API_KEY),
-                                query_intent,
+                needs_selection, prompt_message = requires_subject_type_selection(user_query, query_intent)
+                if context and is_context_refinement_query(user_query, context):
+                    needs_selection = False
+
+                if needs_selection:
+                    render_selection_prompt(
+                        prompt_message,
+                        query_intent,
+                        user_query,
+                        f"live_{len(st.session_state.messages)}",
+                    )
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": prompt_message,
+                            "selection_prompt": True,
+                            "partial_intent": query_intent,
+                            "original_query": user_query,
+                        }
+                    )
+                elif context and is_context_refinement_query(user_query, context):
+                    response = (
+                        "I could not apply that filter to your current question list. "
+                        "Try: `only SUB_TOPIC_GIT_BASICS subtopic questions`"
+                    )
+                    st.markdown(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                else:
+                    with st.spinner("Searching Topin database..."):
+                        try:
+                            results, search_label = search_all_collections(
+                                client, embeddings, user_query, intent_override=query_intent
                             )
-                            response = generate_search_intro_llm(
-                                user_query,
-                                query_intent,
-                                0,
-                                collections,
-                                no_results=True,
-                            )
-                            st.markdown(response)
+                            if not results:
+                                collections = filter_collections(
+                                    get_searchable_collections(),
+                                    query_intent,
+                                )
+                                response = generate_search_intro_llm(
+                                    user_query,
+                                    query_intent,
+                                    0,
+                                    collections,
+                                    no_results=True,
+                                )
+                                st.markdown(response)
+                                st.session_state.messages.append({"role": "assistant", "content": response})
+                                st.session_state.search_context = None
+                            else:
+                                query = build_query_from_intent(query_intent)
+                                pool = (
+                                    fetch_pool_for_intent(client, embeddings, query_intent, query)
+                                    if intent_has_filters(query_intent)
+                                    else results
+                                )
+                                collections_used = sorted({item["collection"] for item in results})
+                                search_label = generate_search_intro_llm(
+                                    user_query,
+                                    query_intent,
+                                    len(results),
+                                    collections_used,
+                                )
+                                message_key = f"live_{len(st.session_state.messages)}"
+                                response = render_results(
+                                    results,
+                                    search_label,
+                                    message_key,
+                                    matched_tags=query_intent.get("tags"),
+                                )
+                                update_search_context(query_intent, results, pool, query)
+                                st.session_state.messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": response,
+                                        "search_label": search_label,
+                                        "results": results,
+                                        "matched_tags": query_intent.get("tags"),
+                                    }
+                                )
+                        except Exception as exc:
+                            response = f"Search failed: {exc}"
+                            st.error(response)
                             st.session_state.messages.append({"role": "assistant", "content": response})
-                            st.session_state.search_context = None
-                        else:
-                            query = build_query_from_intent(query_intent)
-                            pool = (
-                                fetch_pool_for_intent(client, embeddings, query_intent, query)
-                                if intent_has_filters(query_intent)
-                                else results
-                            )
-                            collections_used = sorted({item["collection"] for item in results})
-                            search_label = generate_search_intro_llm(
-                                user_query,
-                                query_intent,
-                                len(results),
-                                collections_used,
-                            )
-                            message_key = f"live_{len(st.session_state.messages)}"
-                            response = render_results(
-                                results,
-                                search_label,
-                                message_key,
-                                matched_tags=query_intent.get("tags"),
-                            )
-                            update_search_context(query_intent, results, pool, query)
-                            st.session_state.messages.append(
-                                {
-                                    "role": "assistant",
-                                    "content": response,
-                                    "search_label": search_label,
-                                    "results": results,
-                                    "matched_tags": query_intent.get("tags"),
-                                }
-                            )
-                    except Exception as exc:
-                        response = f"Search failed: {exc}"
-                        st.error(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
